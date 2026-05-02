@@ -52,3 +52,11 @@ dev = [
     "pytest-asyncio>=0.24",
     "ruff>=0.7",
 ]
+
+[tool.pytest.ini_options]
+asyncio_mode = "auto"
+testpaths = ["tests"]
+filterwarnings = [
+    # silence noisy DeprecationWarning from upstream deps in test output
+    "ignore::DeprecationWarning",
+]
