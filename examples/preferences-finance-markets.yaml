@@ -1,0 +1,81 @@
+# sift preset: finance, markets, macro, investing.
+# Free-source biased — Bloomberg/FT/WSJ are paywalled and don't expose
+# scrapable RSS. Substitutes the analytical blog crowd that often
+# precedes the headlines.
+# Copy to preferences.yaml and tweak.
+
+topics: |
+  - Macro: rates, inflation, central-bank policy, employment data.
+    Especially when prints diverge from consensus.
+
+  - Markets: equity, fixed income, FX, commodities. Concentration risks,
+    valuation regime shifts, big rebalances.
+
+  - Company stories with structural implications — M&A that changes
+    competitive landscape, earnings that signal sector turns, regulation
+    that constrains a business model.
+
+  - Crypto/defi only when it intersects traditional finance (ETF flows,
+    bank exposure, regulatory enforcement). Skip pure altcoin drama.
+
+  - Investing methodology and behavioral finance. Risk management,
+    portfolio construction, quantified results.
+
+  Score down: pundit hot takes without data, day-trading TikTok
+  thinkpieces, generic "market down on inflation fears" wire copy.
+
+exclude_keywords:
+  - astrology
+  - meme stock
+  - "to the moon"
+
+relevance_threshold: 7
+summary_target_words: 90
+max_per_cycle: 3
+
+digest_time: "07:30"        # before market open in most TZs
+digest_size: 10
+more_size: 5
+
+sources:
+  # Aggregator — HN's Show HN economics tag is sparse but useful
+  - id: hn
+    enabled: true
+    query: "Federal Reserve OR inflation OR market OR \"interest rates\" OR earnings OR economy"
+    min_points: 100
+    cadence_seconds: 1800
+
+  # Analytical blogs
+  - id: rss:calculated-risk
+    enabled: true
+    url: https://www.calculatedriskblog.com/feeds/posts/default
+    cadence_seconds: 7200
+
+  - id: rss:marginal-revolution
+    enabled: true
+    url: https://marginalrevolution.com/feed
+    cadence_seconds: 7200
+
+  - id: rss:wealth-of-common-sense
+    enabled: true
+    url: https://awealthofcommonsense.com/feed/
+    cadence_seconds: 14400
+
+  # Mainstream tech-press finance coverage (free)
+  - id: rss:techcrunch
+    enabled: true
+    url: https://techcrunch.com/feed/
+    cadence_seconds: 7200
+
+  # Communities — JSON API with min-score filter (kills low-effort posts)
+  - id: reddit:economics
+    enabled: true
+    subreddit: economics
+    min_points: 200
+    cadence_seconds: 7200
+
+  - id: reddit:investing
+    enabled: true
+    subreddit: investing
+    min_points: 200
+    cadence_seconds: 7200

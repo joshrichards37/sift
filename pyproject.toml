@@ -1,0 +1,54 @@
+[project]
+name = "sift-news"
+version = "0.1.0"
+description = "Self-hosted personal news agent with Telegram delivery and a local LLM relevance filter"
+authors = [{ name = "Joshua Richards", email = "joshua.richards135@gmail.com" }]
+license = "MIT"
+readme = "README.md"
+requires-python = ">=3.12"
+keywords = ["news", "rss", "telegram", "llm", "ollama", "digest", "self-hosted"]
+classifiers = [
+    "Programming Language :: Python :: 3",
+    "Programming Language :: Python :: 3.12",
+    "License :: OSI Approved :: MIT License",
+    "Operating System :: OS Independent",
+    "Topic :: Internet",
+    "Topic :: Communications :: Chat",
+    "Environment :: Console",
+]
+dependencies = [
+    "python-telegram-bot[job-queue]>=21.6",
+    "feedparser>=6.0.11",
+    "atproto>=0.0.55",
+    "httpx>=0.27",
+    "pydantic>=2.9",
+    "pydantic-settings>=2.5",
+    "pyyaml>=6.0",
+    "openai>=1.54",
+    "tenacity>=9.0",
+]
+
+[project.scripts]
+sift = "sift.main:run"
+sift-setup = "sift.wizard:main"
+
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+[tool.hatch.build.targets.wheel]
+packages = ["src/sift"]
+
+[tool.ruff]
+line-length = 100
+target-version = "py312"
+
+[tool.ruff.lint]
+select = ["E", "F", "I", "B", "UP", "SIM"]
+
+[dependency-groups]
+dev = [
+    "pytest>=8.3",
+    "pytest-asyncio>=0.24",
+    "ruff>=0.7",
+]

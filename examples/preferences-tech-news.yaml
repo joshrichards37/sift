@@ -1,0 +1,92 @@
+# sift preset: tech industry news, broadly.
+# Hardware, software, dev tools, security, business stories with engineering angles.
+# Copy to preferences.yaml and tweak.
+
+topics: |
+  - Tech industry shifts that change what tools or services are usable —
+    new dev tools, programming languages, frameworks, infra services, big
+    open-source releases.
+
+  - Hardware: CPUs, GPUs, mobile silicon, networking, storage. New chip
+    launches, benchmarks, supply-chain stories with downstream implications.
+
+  - Software engineering practice: post-mortems, performance debugging,
+    architecture decisions at scale, war stories, SRE / observability.
+
+  - Security: novel vulnerabilities, breach post-mortems, supply-chain
+    attacks. Skip vendor advisories that don't change architecture.
+
+  - Business of tech with product/engineering implications: acquisitions
+    that affect tools you use, layoffs that signal strategy shifts,
+    regulation that constrains what's possible.
+
+  Score down: vague AI thinkpieces, "X is dead" hot takes, fundraising
+  rounds without product news, generic startup advice, gossip.
+
+exclude_keywords:
+  - cryptocurrency
+  - NFT
+  - astrology
+  - celebrity
+
+relevance_threshold: 7
+summary_target_words: 80
+max_per_cycle: 3
+
+digest_time: "09:00"
+digest_size: 10
+more_size: 5
+
+sources:
+  # Aggregator
+  - id: hn
+    enabled: true
+    query: "Show HN OR \"Ask HN\" OR Linux OR security OR Rust OR Go OR Python OR cloud OR open source"
+    min_points: 100
+    cadence_seconds: 1800
+
+  # Mainstream tech press
+  - id: rss:techcrunch
+    enabled: true
+    url: https://techcrunch.com/feed/
+    cadence_seconds: 3600
+
+  - id: rss:the-verge
+    enabled: true
+    url: https://www.theverge.com/rss/index.xml
+    cadence_seconds: 3600
+
+  - id: rss:ars-technica
+    enabled: true
+    url: https://feeds.arstechnica.com/arstechnica/index
+    cadence_seconds: 3600
+
+  # Engineering practitioners
+  - id: rss:dan-luu
+    enabled: true
+    url: https://danluu.com/atom.xml
+    cadence_seconds: 21600
+
+  - id: rss:julia-evans
+    enabled: true
+    url: https://jvns.ca/atom.xml
+    cadence_seconds: 14400
+
+  # Maker / hardware
+  - id: rss:hackaday
+    enabled: true
+    url: https://hackaday.com/blog/feed/
+    cadence_seconds: 7200
+
+  # Communities — JSON API with min-score filter (kills low-effort posts)
+  - id: reddit:programming
+    enabled: true
+    subreddit: programming
+    min_points: 200
+    cadence_seconds: 3600
+
+  - id: reddit:technology
+    enabled: true
+    subreddit: technology
+    min_points: 500
+    cadence_seconds: 7200

@@ -1,0 +1,139 @@
+# sift preset: AI tooling, harness engineering, agent workflows.
+# Author: Josh's instance — what shipped first.
+# Copy to preferences.yaml and tweak.
+
+topics: |
+  - Harness engineering: Claude Code (CLI, hooks, MCP, slash commands, IDE
+    integrations, settings.json, sub-agents, skills), Cursor, Aider, Claude
+    Agent SDK, Anthropic API. New features, settings tricks, workflow patterns
+    that get reliable output from agents.
+
+  - CLAUDE.md / AGENTS.md craft — repo-level instructions, system prompts,
+    context management, the patterns that produce consistent behavior across
+    sessions and codebases.
+
+  - Multi-agent orchestration — coordinator/worker patterns, sub-agents,
+    parallel agent loops, inter-agent comms, autonomy boundaries, when to
+    spawn-and-forget vs. keep in-loop.
+
+  - Plan-then-implement workflows — design briefs, ADRs, RFCs handed to
+    agents for unattended execution. The end goal: design once, implement
+    with no human intervention.
+
+  - "AI second brain" / personal-knowledge workflows — Karpathy's setup,
+    Andy Matuschak's evergreen notes, Linus Lee + Maggie Appleton's
+    tools-for-thought, Obsidian + LLM integrations, RAG over personal corpora.
+
+  - Eval frameworks for agents — braintrust, promptfoo, inspect, langsmith.
+    Regression-testing prompts and tool-use loops, agentic benchmarks.
+
+  - Local/agent infrastructure — Ollama, llama.cpp, vLLM, MCP servers, agent
+    skills, vector retrieval, on-device inference patterns.
+
+  - Top-voice posts — when Karpathy, Simon Willison, Hamel Husain, Eugene Yan,
+    swyx (Latent Space), Geoffrey Litt, Linus Lee, Maggie Appleton, Andy
+    Matuschak, Sam Altman, Dario Amodei publish. They earn extra credit.
+
+  - Model releases (Claude 4.x, Gemini, GPT, open-source weights) — only when
+    they meaningfully change what's possible at the harness/agent layer.
+
+  Score down: generic "AI is changing everything" thinkpieces, fundraising
+  announcements without product implications, AGI safety philosophy debates,
+  consumer chatbot drama.
+
+exclude_keywords:
+  - cryptocurrency
+  - NFT
+  - generative-art prompt-trading
+  - AGI doom
+  - effective altruism
+
+relevance_threshold: 7
+summary_target_words: 80
+max_per_cycle: 3
+
+digest_time: "09:00"
+digest_size: 10
+more_size: 5
+
+sources:
+  - id: hn
+    enabled: true
+    query: "Claude OR Anthropic OR Cursor OR LangChain OR MCP OR Ollama OR vLLM OR \"AI agent\" OR \"agent SDK\""
+    min_points: 50
+    cadence_seconds: 1800
+
+  - id: rss:simonwillison
+    enabled: true
+    url: https://simonwillison.net/atom/everything/
+    cadence_seconds: 1800
+
+  - id: rss:hamel
+    enabled: true
+    url: https://hamel.dev/index.xml
+    cadence_seconds: 14400
+
+  - id: rss:eugene-yan
+    enabled: true
+    url: https://eugeneyan.com/rss/
+    cadence_seconds: 14400
+
+  - id: rss:latent-space
+    enabled: true
+    url: https://www.latent.space/feed
+    cadence_seconds: 3600
+
+  - id: rss:geoffrey-litt
+    enabled: true
+    url: https://www.geoffreylitt.com/feed.xml
+    cadence_seconds: 14400
+
+  - id: rss:maggie-appleton
+    enabled: true
+    url: https://maggieappleton.com/rss.xml
+    cadence_seconds: 14400
+
+  - id: rss:linus-lee
+    enabled: true
+    url: https://thesephist.com/index.xml
+    cadence_seconds: 14400
+
+  - id: rss:andy-matuschak
+    enabled: true
+    url: https://andymatuschak.org/feed.xml
+    cadence_seconds: 21600
+
+  - id: rss:steph-ango
+    enabled: true
+    url: https://stephango.com/feed.xml
+    cadence_seconds: 14400
+
+  - id: rss:sam-altman
+    enabled: true
+    url: https://blog.samaltman.com/posts.atom
+    cadence_seconds: 21600
+
+  # YouTube channel — Atom feed at /feeds/videos.xml?channel_id=<UC...>.
+  # See docs/sources.md for resolving @handle to the UC... id.
+  - id: rss:karpathy-youtube
+    enabled: true
+    url: https://www.youtube.com/feeds/videos.xml?channel_id=UCXUPKJO5MZQN11PqgIvyuvQ
+    cadence_seconds: 21600
+
+  - id: reddit:claudeai
+    enabled: true
+    subreddit: ClaudeAI
+    min_points: 50
+    cadence_seconds: 3600
+
+  - id: reddit:localllama
+    enabled: true
+    subreddit: LocalLLaMA
+    min_points: 100
+    cadence_seconds: 3600
+
+  - id: reddit:langchain
+    enabled: true
+    subreddit: LangChain
+    min_points: 30
+    cadence_seconds: 7200

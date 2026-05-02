@@ -1,0 +1,24 @@
+# Personal / agent state — kept out of the public repo
+.beads/
+.claude/settings.json
+.claude/settings.local.json
+CLAUDE.local.md
+AGENTS.local.md
+
+# Runtime artifacts
+*.db
+.dolt/
+
+# Local config (per-deployment)
+.env
+preferences.yaml
+
+# Python
+__pycache__/
+*.py[cod]
+.venv/
+.pytest_cache/
+.ruff_cache/
+*.egg-info/
+dist/
+build/

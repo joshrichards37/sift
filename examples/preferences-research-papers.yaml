@@ -1,0 +1,81 @@
+# sift preset: ML/NLP research papers and lab posts.
+# Best for keeping up with arXiv, top labs, and technical research blogs
+# without drowning in cs.LG firehose.
+# Copy to preferences.yaml and tweak.
+
+topics: |
+  - Foundation-model architecture and training: scaling, data quality,
+    pretraining recipes, post-training (SFT/RLHF/DPO/etc), evals.
+
+  - Inference and serving: speculative decoding, quantization, MoE
+    routing, KV-cache tricks, on-device. Anything that changes
+    quality-per-dollar or latency-per-token.
+
+  - Agents and tool use as a research topic — tool-use benchmarks,
+    long-horizon planning, multi-agent coordination, autonomy.
+
+  - Retrieval, memory, RAG architectures — beyond "embed and search":
+    structured retrieval, hybrid search, learned retrievers.
+
+  - Safety/alignment papers WITH technical content (interpretability,
+    red-teaming methodology, jailbreak research). Skip philosophical
+    op-eds.
+
+  - Empirical / negative results — papers that show what *doesn't* work
+    are often more useful than yet-another-SOTA claim.
+
+  Score down: incremental SOTA bumps without methodological novelty,
+  one-task fine-tuning papers, dataset-only papers without analysis,
+  position papers, retracted/superseded work.
+
+exclude_keywords:
+  - cryptocurrency
+
+relevance_threshold: 7
+summary_target_words: 100   # papers need a longer summary
+max_per_cycle: 5            # arxiv is high-volume; score more per cycle
+
+digest_time: "08:00"
+digest_size: 10
+more_size: 5
+
+sources:
+  # arXiv RSS — these are noisy. Threshold + topic prompt do the filtering.
+  - id: rss:arxiv-cs-cl
+    enabled: true
+    url: http://export.arxiv.org/rss/cs.CL
+    cadence_seconds: 21600
+
+  - id: rss:arxiv-cs-lg
+    enabled: true
+    url: http://export.arxiv.org/rss/cs.LG
+    cadence_seconds: 21600
+
+  - id: rss:arxiv-cs-ai
+    enabled: true
+    url: http://export.arxiv.org/rss/cs.AI
+    cadence_seconds: 21600
+
+  # Lab + practitioner blogs
+  - id: rss:huggingface-blog
+    enabled: true
+    url: https://huggingface.co/blog/feed.xml
+    cadence_seconds: 14400
+
+  - id: rss:bair
+    enabled: true
+    url: https://bair.berkeley.edu/blog/feed.xml
+    cadence_seconds: 86400   # ~daily
+
+  - id: rss:lilian-weng
+    enabled: true
+    url: https://lilianweng.github.io/index.xml
+    cadence_seconds: 86400
+
+  # HN as a curation layer — papers that get traction on HN are usually
+  # worth reading regardless of which subfield.
+  - id: hn
+    enabled: true
+    query: "arxiv OR \"paper\" OR transformer OR diffusion OR neural OR \"language model\""
+    min_points: 100
+    cadence_seconds: 3600

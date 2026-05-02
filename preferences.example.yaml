@@ -1,0 +1,79 @@
+# Sample preferences. Copy to preferences.yaml and edit.
+#
+# This is a topic-agnostic skeleton. For ready-to-use presets covering
+# specific domains (AI tooling, tech news, research papers, finance), see
+# the examples/ directory and copy whichever fits:
+#
+#     cp examples/preferences-tech-news.yaml preferences.yaml
+
+# What you care about. Free-text — the LLM scores articles against this.
+# Be specific. "Foundation-model releases, agent SDKs, Claude Code features"
+# beats "AI". Lists of named entities (people, companies, products) help a lot.
+topics: |
+  - <topic 1: be specific about what's in scope, name people/products if you can>
+  - <topic 2>
+  - <topic 3>
+
+  Score down: <kinds of articles you don't want even if they technically match
+  one of your topics — e.g. funding announcements without product implications>
+
+# Hard exclusion — articles whose title or body contains any of these are
+# scored 1 without an LLM call.
+exclude_keywords:
+  - cryptocurrency
+  - NFT
+
+# Relevance threshold (1-10). Articles below this are dropped silently.
+# Tune up if Telegram is too noisy, down if you're missing things.
+relevance_threshold: 7
+
+# How long an executive summary should be (LLM target, not a hard cap).
+summary_target_words: 80
+
+# Cap of LLM scoring calls per source per poll. Keeps the GPU bounded when
+# a fresh source has a big backlog. Articles beyond the cap are scored on
+# the next poll cycle.
+max_per_cycle: 3
+
+# Digest mode — one batched message per day at the configured local time.
+# /digest sends manually; /more pulls the next page from the backlog.
+digest_time: "09:00"
+digest_size: 10
+more_size: 5
+
+# Sources. Every source has a stable id (used as a foreign key in storage).
+# kind = first segment before ':' — supported: rss, hn, reddit, bsky.
+#
+# Cadence_seconds is per-source poll interval. Slower for low-velocity blogs
+# (1 day = 86400s), faster for newsy feeds (30 min = 1800s).
+sources:
+  # Hacker News via Algolia. query is a free-text search; multiple terms
+  # are combined with " OR " (split client-side — Algolia doesn't support OR
+  # inside one query). min_points filters to popular stories.
+  - id: hn
+    enabled: true
+    query: "<keyword 1> OR <keyword 2> OR \"exact phrase\""
+    min_points: 50
+    cadence_seconds: 1800
+
+  # An RSS or Atom feed. Anything feedparser handles works (RSS, Atom,
+  # YouTube channel feeds, Substack, etc.).
+  - id: rss:example-blog
+    enabled: true
+    url: https://example.com/feed.xml
+    cadence_seconds: 3600
+
+  # Reddit via the public JSON API. `subreddit` accepts a single name or a
+  # `+`-joined combo for a multi-sub feed. min_points filters out low-score
+  # posts before they reach the LLM scorer — set 50+ on busy subs.
+  - id: reddit:example
+    enabled: false
+    subreddit: programming           # or: programming+rust+golang
+    min_points: 100
+    cadence_seconds: 3600
+
+  # Bluesky author feed. Requires BLUESKY_HANDLE + BLUESKY_APP_PASSWORD in .env.
+  - id: bsky:example-handle
+    enabled: false
+    handle: example.bsky.social
+    cadence_seconds: 900
