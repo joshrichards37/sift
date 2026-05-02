@@ -26,3 +26,6 @@ jobs:
 
       - name: ruff format --check
         run: uv run ruff format --check src/
+
+      - name: pytest
+        run: uv run pytest

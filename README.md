@@ -10,7 +10,7 @@
 
 Can't keep up with the fields you actually care about? Same. So I built this: a bot that watches your trusted sources, scores each article against your stated interests with a local LLM, and ships one Telegram digest a day. One message instead of forty open tabs. Runs on your own machine, your data stays yours.
 
-Polls RSS, Hacker News, Bluesky (and anything else you write a Source for), scores each article 1-10 against your stated topics, summarises what passes, and sends one batched message a day. You can `/digest` for an immediate batch, `/more` to pull from the backlog, or just chat with the bot to ask follow-up questions over recent articles.
+Polls RSS, Hacker News, Reddit, Bluesky (and anything else you write a Source for), scores each article 1-10 against your stated topics, summarises what passes, and sends one batched message a day. You can `/digest` for an immediate batch, `/more` to pull from the backlog, or just chat with the bot to ask follow-up questions over recent articles.
 
 Single Python process, single SQLite file. Runs on a workstation. Optional small allowlist for sharing one feed with friends or family.
 
@@ -115,9 +115,9 @@ What's shared vs. private:
 
 Heads-up for friends:
 - Bot runs on your machine. When your laptop sleeps, the bot is offline.
-- Free-text chat queries flow through your Ollama (you can read them in the DB if you want — they should know).
+- Free-text chat queries flow through whichever LLM backend you configured (local Ollama / LM Studio / hosted API). You can read them in the DB if you want — they should know.
 
-If your group grows past ~5 active users, consider having them self-host instead (clone the repo, register their own BotFather token, run their own Ollama or use Gemini Flash free tier). Same code, no infra burden on you.
+If your group grows past ~5 active users, consider having them self-host instead (clone the repo, register their own BotFather token, bring their own LLM backend — local Ollama or a free hosted tier like Gemini Flash). Same code, no infra burden on you.
 
 ## Adding a source
 
@@ -152,14 +152,15 @@ Full per-backend instructions (Ollama, LM Studio, llama.cpp, MLX-LM, OpenRouter,
 
 SQLite at `./sift.db`. Schema in `src/sift/storage.py` (`articles`, `feedback`, `source_cursor`). Inspect with `sqlite3 sift.db`.
 
-## Lint / format
+## Lint / format / test
 
 ```bash
 uv run ruff check src/
 uv run ruff format src/
+uv run pytest
 ```
 
-No tests yet — added when there's a regression worth pinning.
+Tests live in `tests/` and stay narrow on purpose — env-var resolution, source payload parsing, LLM JSON handling, storage roundtrips, and message chunking. CI runs all three commands on every PR; branch protection on `main` requires the `lint` check to pass before merge.
 
 ## Sample systemd user unit
 
@@ -190,7 +191,7 @@ Then `systemctl --user daemon-reload && systemctl --user enable --now sift`.
 - [`docs/sources.md`](docs/sources.md) — source types, cadence guidelines, writing your own
 - [`docs/prompting.md`](docs/prompting.md) — how relevance + summary prompts work, tuning
 - [`docs/deploy.md`](docs/deploy.md) — tmux, systemd, launchd, VPS patterns
-- [`CLAUDE.md`](CLAUDE.md) — architecture, conventions, contributing context for AI agents
+- [`AGENTS.md`](AGENTS.md) — architecture, conventions, contributing context for AI agents (`CLAUDE.md` symlinks here)
 - [`CONTRIBUTING.md`](CONTRIBUTING.md) — PR process, style, commit conventions
 
 ## License
