@@ -8,6 +8,7 @@ from datetime import datetime, timedelta
 from html import escape
 
 from sift.config import Preferences, Settings
+from sift.recommender import record_for_chat, suggest_for_chat
 from sift.storage import (
     connect,
     count_unpushed,
@@ -29,9 +30,37 @@ async def digest_loop(settings: Settings, prefs: Preferences, send: SendText) ->
         log.info("next digest at %s (in %.0f min)", next_run.isoformat(), sleep_s / 60)
         await asyncio.sleep(sleep_s)
         try:
+            populate_suggestions(settings, prefs)
             await run_digest(settings, prefs, send)
         except Exception:
             log.exception("digest failed")
+
+
+def populate_suggestions(settings: Settings, prefs: Preferences) -> int:
+    """Run the taste-discovery suggester for each authorised chat and record
+    any qualifying suggestion. Returns the count recorded.
+
+    Idempotent at the per-chat level — if a chat already has a pending
+    (un-responded) suggestion, the digest UX layer surfaces that one and
+    the recommender is free to add another. We don't dedupe here because
+    the storage layer enforces 'one pending shown at a time' via the query
+    in pending_suggestion_for, and the per-chat mute/decline checks in the
+    suggester prevent re-suggesting topics the user has already rejected."""
+    recorded = 0
+    with connect(settings.db_path) as conn:
+        for chat_id in settings.chat_ids:
+            suggestion = suggest_for_chat(conn, chat_id=str(chat_id), prefs_topics=prefs.topics)
+            if suggestion is None:
+                continue
+            record_for_chat(conn, chat_id=str(chat_id), suggestion=suggestion)
+            log.info(
+                "recorded suggestion for chat %s: topic=%r confidence=%.2f",
+                chat_id,
+                suggestion.topic,
+                suggestion.confidence,
+            )
+            recorded += 1
+    return recorded
 
 
 async def run_digest(settings: Settings, prefs: Preferences, send: SendText) -> int:
