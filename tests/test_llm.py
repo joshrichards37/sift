@@ -36,7 +36,39 @@ def _llm_with_response(content: str) -> LLM:
 async def test_score_parses_valid_json() -> None:
     llm = _llm_with_response(json.dumps({"score": 8, "reason": "matches topics"}))
     out = await llm.score_relevance(_article(), _prefs())
-    assert out == Score(score=8, reason="matches topics")
+    assert out == Score(score=8, reason="matches topics", topic_tags=[])
+
+
+async def test_score_extracts_topic_tags() -> None:
+    """Topic tags ride along on the same scoring call. Lowercase, trimmed, capped at 3."""
+    llm = _llm_with_response(
+        json.dumps(
+            {
+                "score": 9,
+                "reason": "directly on-topic",
+                "topic_tags": ["  Post-Training  ", "RLHF", "Alignment", "Dropped"],
+            }
+        )
+    )
+    out = await llm.score_relevance(_article(), _prefs())
+    assert out.topic_tags == ["post-training", "rlhf", "alignment"]
+
+
+async def test_score_topic_tags_default_empty_when_missing() -> None:
+    """Older models / models that ignore the new prompt field must not crash."""
+    llm = _llm_with_response(json.dumps({"score": 7, "reason": "ok"}))
+    out = await llm.score_relevance(_article(), _prefs())
+    assert out.topic_tags == []
+
+
+async def test_score_topic_tags_robust_to_garbage() -> None:
+    """If topic_tags comes back as the wrong shape, the score still survives."""
+    llm = _llm_with_response(
+        json.dumps({"score": 7, "reason": "ok", "topic_tags": "not-a-list"})
+    )
+    out = await llm.score_relevance(_article(), _prefs())
+    assert out.score == 7
+    assert out.topic_tags == []
 
 
 async def test_score_clamps_above_ten() -> None:

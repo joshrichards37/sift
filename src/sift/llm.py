@@ -2,7 +2,7 @@ from __future__ import annotations
 
 import json
 import logging
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 
 from openai import AsyncOpenAI
 from tenacity import retry, retry_if_exception_type, stop_after_attempt, wait_exponential
@@ -20,7 +20,13 @@ RELEVANCE_SYSTEM = """You score how relevant an article is to a user's interests
 5  = adjacent / occasionally interesting.
 1  = unrelated noise.
 
-Reply with strict JSON only: {"score": <int 1-10>, "reason": "<one short sentence>"}.
+You also tag the article with 1-3 short topic labels (lowercase, 1-3 words each)
+that capture what it's actually about, e.g. "post-training", "rust async", "fed policy".
+Topic tags are independent of the user's stated interests — describe the article,
+not its match to the user.
+
+Reply with strict JSON only:
+{"score": <int 1-10>, "reason": "<one short sentence>", "topic_tags": ["tag1", "tag2"]}
 No markdown, no preamble."""
 
 
@@ -37,6 +43,7 @@ SUMMARY_SYSTEM = """You write executive summaries for a busy technical reader.
 class Score:
     score: int
     reason: str
+    topic_tags: list[str] = field(default_factory=list)
 
 
 class LLM:
@@ -77,11 +84,12 @@ class LLM:
             parsed = json.loads(raw)
             score = int(parsed.get("score", 0))
             reason = str(parsed.get("reason", ""))[:200]
+            topic_tags = _parse_topic_tags(parsed.get("topic_tags"))
         except (json.JSONDecodeError, ValueError, TypeError):
             log.warning("relevance returned non-JSON: %r", raw)
             return Score(score=0, reason="parse-failed")
         score = max(1, min(10, score))
-        return Score(score=score, reason=reason)
+        return Score(score=score, reason=reason, topic_tags=topic_tags)
 
     @retry(
         stop=stop_after_attempt(3),
@@ -126,3 +134,18 @@ def _truncate(text: str, limit: int) -> str:
     if len(text) <= limit:
         return text
     return text[:limit] + "…"
+
+
+def _parse_topic_tags(raw: object) -> list[str]:
+    """Coerce the model's topic_tags field into a clean list. Caps at 3 tags
+    and 40 chars/tag — the prompt asks for that, but models drift."""
+    if not isinstance(raw, list):
+        return []
+    out: list[str] = []
+    for item in raw[:3]:
+        if not isinstance(item, str):
+            continue
+        cleaned = item.strip().lower()[:40]
+        if cleaned:
+            out.append(cleaned)
+    return out
