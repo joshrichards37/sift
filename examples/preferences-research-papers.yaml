@@ -32,7 +32,7 @@ exclude_keywords:
   - cryptocurrency
 
 relevance_threshold: 7
-summary_target_words: 100   # papers need a longer summary
+summary_target_words: 50
 max_per_cycle: 5            # arxiv is high-volume; score more per cycle
 
 digest_time: "08:00"

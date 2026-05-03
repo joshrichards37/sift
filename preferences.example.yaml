@@ -27,8 +27,11 @@ exclude_keywords:
 # Tune up if Telegram is too noisy, down if you're missing things.
 relevance_threshold: 7
 
-# How long an executive summary should be (LLM target, not a hard cap).
-summary_target_words: 80
+# Maximum summary length in words. Hard ceiling, not a target. Default 50
+# fits a 10-item digest in one Telegram message (≤4096 chars) without
+# chunking. Drop to ~10 for headline-style; bump higher only if the digest
+# splitting across multiple messages doesn't bother you.
+summary_target_words: 50
 
 # Cap of LLM scoring calls per source per poll. Keeps the GPU bounded when
 # a fresh source has a big backlog. Articles beyond the cap are scored on
