@@ -63,9 +63,7 @@ async def test_score_topic_tags_default_empty_when_missing() -> None:
 
 async def test_score_topic_tags_robust_to_garbage() -> None:
     """If topic_tags comes back as the wrong shape, the score still survives."""
-    llm = _llm_with_response(
-        json.dumps({"score": 7, "reason": "ok", "topic_tags": "not-a-list"})
-    )
+    llm = _llm_with_response(json.dumps({"score": 7, "reason": "ok", "topic_tags": "not-a-list"}))
     out = await llm.score_relevance(_article(), _prefs())
     assert out.score == 7
     assert out.topic_tags == []

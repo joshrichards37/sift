@@ -214,6 +214,63 @@ Two paths:
 
 ---
 
+## Validating a backend (`sift-bench`)
+
+Before committing a new backend to a long unattended run, benchmark it. `sift-bench` runs a fixed set of synthetic articles through the configured backend's scoring + summary paths, captures per-call latency and token usage, and projects per-user/day cost given the standard sift workload (100 articles scored to deliver 10).
+
+```bash
+# Basic run — uses your existing .env config
+uv run sift-bench
+
+# Smaller / faster
+uv run sift-bench --n-scoring 10 --n-summary 3
+
+# With cost projection (rates as of 2026-05; check current pricing)
+uv run sift-bench --input-cost 0.59 --output-cost 0.79      # Groq Llama 3.3 70B
+uv run sift-bench --input-cost 0.15 --output-cost 0.60      # OpenAI gpt-4o-mini
+uv run sift-bench --input-cost 0.10 --output-cost 0.40      # Gemini 2.5 Flash via OpenRouter
+
+# Machine-readable output for scripting / CI
+uv run sift-bench --json
+```
+
+Sample output:
+
+```
+sift-bench — backend validation
+================================
+Backend:                    https://api.groq.com/openai/v1
+Model:                      llama-3.3-70b-versatile
+Calls:                      30 scoring, 10 summary
+
+Latency
+-------
+  Scoring  p50 / p95:            420 ms /      650 ms
+  Summary  p50 / p95:            900 ms /     1300 ms
+
+Token usage (per call, average)
+--------------------------------
+  Scoring  in / out:             520    /       45
+  Summary  in / out:            1480    /      135
+
+Projection — 1 user / day  (100 scored, 10 summarised)
+-----------------------------------------------------------------
+  Tokens in / out:               66,800 /      5,850
+  Wall time:                     51.0 s
+  Cost / user / day:        $0.0440
+```
+
+What to look for:
+
+- **Wall time per user/day** — if this exceeds a few seconds for one user, scaling is going to hurt. Self-hosted backends should clock in well under a minute; hosted backends typically under 30s.
+- **p95 vs p50 latency** — large gaps signal occasional rate limiting or cold-starts. Investigate before going unattended.
+- **Cost / user / day × your user count** — multiply by the number of authorised chats sharing the feed. Hosted backends with per-user economics should be well under $1/user/month at this workload.
+- **Failed JSON parsing** — score returns `parse-failed` when the model produces invalid JSON. Common with reasoning-tuned variants (`-thinking`, `o1`-like, `r1`). Switch to a chat-tuned model.
+
+The benchmark is sequential (one call at a time) — measures single-stream latency, which matches sift's per-source scheduler. It does not stress-test concurrent throughput.
+
+---
+
 ## Troubleshooting
 
 | Symptom | Likely cause |

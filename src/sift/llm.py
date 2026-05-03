@@ -49,6 +49,10 @@ class LLM:
     def __init__(self, *, base_url: str, api_key: str, model: str) -> None:
         self.client = AsyncOpenAI(base_url=base_url, api_key=api_key)
         self.model = model
+        # Set after each successful API call from response.usage. Read by the
+        # benchmark tool (sift-bench) to project per-user/day cost. Production
+        # paths ignore this — it's purely instrumentation.
+        self.last_usage: tuple[int, int] | None = None  # (input_tokens, output_tokens)
 
     @retry(
         stop=stop_after_attempt(3),
@@ -78,6 +82,7 @@ class LLM:
             response_format={"type": "json_object"},
             temperature=0.2,
         )
+        self._record_usage(resp)
         raw = resp.choices[0].message.content or "{}"
         try:
             parsed = json.loads(raw)
@@ -113,7 +118,21 @@ class LLM:
             ],
             temperature=0.3,
         )
+        self._record_usage(resp)
         return (resp.choices[0].message.content or "").strip()
+
+    def _record_usage(self, resp: object) -> None:
+        """Capture (input_tokens, output_tokens) from response.usage if present.
+        Some hosted backends omit the usage field on stream-like paths — silently
+        leave last_usage unchanged in that case rather than crash a production call."""
+        usage = getattr(resp, "usage", None)
+        if usage is None:
+            return
+        prompt = getattr(usage, "prompt_tokens", None)
+        completion = getattr(usage, "completion_tokens", None)
+        if prompt is None or completion is None:
+            return
+        self.last_usage = (int(prompt), int(completion))
 
     async def chat(self, system: str, history: list[dict], user_msg: str) -> str:
         messages = [
