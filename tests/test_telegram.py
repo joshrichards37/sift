@@ -9,7 +9,9 @@ import pytest
 from sift.config import Settings
 from sift.storage import connect, init_db
 from sift.telegram_bot import (
+    EXPAND_CALLBACK,
     Bot,
+    _build_collapsed_keyboard,
     _build_thumbs_keyboard,
     _chunk,
     _parse_feedback_callback,
@@ -91,30 +93,27 @@ def test_chunk_prefers_paragraph_then_line_then_hard_cut() -> None:
 # --- Thumbs keyboard ---
 
 
-def test_build_thumbs_keyboard_four_buttons_per_row() -> None:
-    """Compact layout: two items packed per row, each as [👍 N][👎 N]. Halves
-    keyboard height vs one-item-per-row. Last row may be 2 buttons if items is odd."""
+def test_build_collapsed_keyboard_is_single_expand_button() -> None:
+    """Default state under a digest: one button. Tapping fires fb:expand and the
+    bot swaps in the per-item keyboard. Keeps the resting state clean."""
+    kb = _build_collapsed_keyboard()
+    assert len(kb.inline_keyboard) == 1
+    assert len(kb.inline_keyboard[0]) == 1
+    assert kb.inline_keyboard[0][0].callback_data == EXPAND_CALLBACK
+
+
+def test_build_thumbs_keyboard_one_row_per_item() -> None:
+    """Expanded state: n items → n rows, [👍 N][👎 N] per row. Pairing each
+    button unambiguously to its number — clearer than packing items 2-per-row."""
     items = [(1, "aaa"), (2, "bbb"), (3, "ccc")]
     kb = _build_thumbs_keyboard(items)
-    assert len(kb.inline_keyboard) == 2  # ceil(3 / 2)
-    # First row packs items 1 and 2 → 4 buttons
-    assert len(kb.inline_keyboard[0]) == 4
+    assert len(kb.inline_keyboard) == 3
+    for row in kb.inline_keyboard:
+        assert len(row) == 2
     assert kb.inline_keyboard[0][0].text == "👍 1"
     assert kb.inline_keyboard[0][1].text == "👎 1"
-    assert kb.inline_keyboard[0][2].text == "👍 2"
-    assert kb.inline_keyboard[0][3].text == "👎 2"
-    # Second row only has item 3 → 2 buttons
-    assert len(kb.inline_keyboard[1]) == 2
-    assert kb.inline_keyboard[1][0].text == "👍 3"
-    assert kb.inline_keyboard[1][1].text == "👎 3"
-
-
-def test_build_thumbs_keyboard_full_ten_items_packs_to_five_rows() -> None:
-    """The default digest_size=10 case — 10 items pack into exactly 5 rows of 4."""
-    items = [(i, f"id{i}") for i in range(1, 11)]
-    kb = _build_thumbs_keyboard(items)
-    assert len(kb.inline_keyboard) == 5
-    assert all(len(row) == 4 for row in kb.inline_keyboard)
+    assert kb.inline_keyboard[2][0].text == "👍 3"
+    assert kb.inline_keyboard[2][1].text == "👎 3"
 
 
 def test_build_thumbs_keyboard_callback_data_format() -> None:
@@ -130,7 +129,8 @@ def test_build_thumbs_keyboard_callback_data_format() -> None:
 
 
 def test_build_thumbs_keyboard_empty_items_returns_empty_keyboard() -> None:
-    """Defensive: edge case if a 'digest' fires with no items. Still valid markup."""
+    """Defensive: edge case if expand fires with no items recorded.
+    Still valid markup."""
     kb = _build_thumbs_keyboard([])
     assert kb.inline_keyboard == ()
 
@@ -244,3 +244,84 @@ async def test_on_feedback_handles_malformed_callback_data(
         rows = conn.execute("SELECT * FROM feedback").fetchall()
     assert rows == []
     answer.assert_awaited_once()
+
+
+# --- Expand callback ---
+
+
+async def test_expand_callback_swaps_in_full_keyboard(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    """Tapping 'Rate items' edits the message reply markup to the full per-item
+    keyboard. The bot recovers items from in-memory state keyed by message_id."""
+    db = tmp_path / "test.db"
+    init_db(db)
+    bot = _make_bot(monkeypatch, db)
+    # Pretend we sent a digest with 3 items earlier. message_id=999.
+    bot._digest_items[999] = [(1, "aid1"), (2, "aid2"), (3, "aid3")]
+    edit_markup = AsyncMock()
+    answer = AsyncMock()
+    update = SimpleNamespace(
+        callback_query=SimpleNamespace(
+            from_user=SimpleNamespace(id=42),
+            data=EXPAND_CALLBACK,
+            message=SimpleNamespace(message_id=999),
+            edit_message_reply_markup=edit_markup,
+            answer=answer,
+        )
+    )
+    await bot._on_feedback(update, None)
+    edit_markup.assert_awaited_once()
+    # The new keyboard should have one row per item (3 rows, 2 buttons each).
+    new_markup = edit_markup.await_args.kwargs["reply_markup"]
+    assert len(new_markup.inline_keyboard) == 3
+    assert new_markup.inline_keyboard[0][0].callback_data == "fb:aid1:+1"
+    answer.assert_awaited_once()
+
+
+async def test_expand_callback_says_expired_when_state_lost(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    """If the bot restarted (or this digest's entry got pruned by the memory
+    cap), tapping Rate must answer politely rather than silently failing or
+    crashing. No markup edit attempted."""
+    db = tmp_path / "test.db"
+    init_db(db)
+    bot = _make_bot(monkeypatch, db)
+    # No entry in _digest_items for message_id=12345 — simulates restart.
+    edit_markup = AsyncMock()
+    answer = AsyncMock()
+    update = SimpleNamespace(
+        callback_query=SimpleNamespace(
+            from_user=SimpleNamespace(id=42),
+            data=EXPAND_CALLBACK,
+            message=SimpleNamespace(message_id=12345),
+            edit_message_reply_markup=edit_markup,
+            answer=answer,
+        )
+    )
+    await bot._on_feedback(update, None)
+    edit_markup.assert_not_awaited()
+    answer.assert_awaited_once()
+    # The user-facing answer should mention the digest expired/restart situation.
+    msg = answer.await_args.args[0] if answer.await_args.args else ""
+    assert "no longer rateable" in msg.lower() or "restart" in msg.lower()
+
+
+def test_prune_digest_memory_drops_oldest(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    """When _digest_items exceeds the cap, the OLDEST message_ids get evicted.
+    Stops the dict from growing unboundedly across many days of digests."""
+    from sift.telegram_bot import DIGEST_MEMORY_CAP
+
+    db = tmp_path / "test.db"
+    init_db(db)
+    bot = _make_bot(monkeypatch, db)
+    # Fill past the cap with monotonic message_ids.
+    for mid in range(DIGEST_MEMORY_CAP + 5):
+        bot._digest_items[mid] = [(1, "x")]
+    bot._prune_digest_memory()
+    assert len(bot._digest_items) == DIGEST_MEMORY_CAP
+    # The oldest 5 (lowest message_ids) should be gone.
+    assert min(bot._digest_items) == 5

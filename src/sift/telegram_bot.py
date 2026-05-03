@@ -25,7 +25,11 @@ from sift.llm import LLM
 from sift.storage import connect, recent_articles, record_feedback
 
 DigestItem = tuple[int, str]  # (item number in the digest, article id)
-FEEDBACK_PREFIX = "fb"  # callback_data form: fb:<article_id>:<+1|-1>
+FEEDBACK_PREFIX = "fb"  # callback_data forms: fb:<article_id>:<+1|-1> | fb:expand
+EXPAND_CALLBACK = f"{FEEDBACK_PREFIX}:expand"
+# Cap on stored digest→items state to prevent unbounded memory growth across
+# many days of digests. Tapping Rate on an older digest just returns "expired".
+DIGEST_MEMORY_CAP = 50
 
 log = logging.getLogger(__name__)
 
@@ -42,6 +46,10 @@ class Bot:
         self.llm = llm
         self._paused = False
         self._chat_history: dict[int, deque] = defaultdict(lambda: deque(maxlen=10))
+        # Maps Telegram message_id → digest items, so the "Rate items" expand
+        # button can recover which articles to thumbs-button. Lives in memory
+        # only — restart drops state and old Rate buttons answer "expired."
+        self._digest_items: dict[int, list[DigestItem]] = {}
         self.app: Application = Application.builder().token(settings.telegram_bot_token).build()
         self._wire_handlers()
 
@@ -73,20 +81,28 @@ class Bot:
     async def send_message_safe(self, text: str, *, items: list[DigestItem] | None = None) -> None:
         """Broadcast text to every authorized chat. HTML first, plain fallback per chat.
 
-        If `items` is provided, attach a thumbs keyboard to the final chunk and
-        disable URL previews — digests carry many URLs and Telegram would
-        otherwise render a huge preview card per chunk, breaking the visual flow
-        with embedded Reddit/YouTube/GitHub panels mid-message. Earlier chunks
-        get no keyboard so the buttons stay anchored to the bottom.
+        If `items` is provided, the message is treated as a digest:
+          - URL previews are disabled so Telegram doesn't embed a giant
+            Reddit/YouTube/GitHub card per chunk
+          - A single 'Rate items' button is attached to the final chunk;
+            tapping it expands into a per-item thumbs keyboard
+          - The items list is stashed against each broadcast's message_id so
+            the expand callback can recover what to render
+        Earlier chunks get no keyboard so the button stays anchored to the bottom.
         """
         if self._paused:
             log.info("paused, dropping broadcast")
             return
         chunks = _chunk(text, TG_MSG_LIMIT)
         is_digest = items is not None
-        markup = _build_thumbs_keyboard(items) if items else None
+        markup = _build_collapsed_keyboard() if items else None
         for chat_id in self.settings.chat_ids:
-            await self._send_to_chat(chat_id, chunks, markup, disable_preview=is_digest)
+            message_id = await self._send_to_chat(
+                chat_id, chunks, markup, disable_preview=is_digest
+            )
+            if items and message_id is not None:
+                self._digest_items[message_id] = items
+        self._prune_digest_memory()
 
     async def _send_to_chat(
         self,
@@ -95,28 +111,46 @@ class Bot:
         markup: InlineKeyboardMarkup | None = None,
         *,
         disable_preview: bool = False,
-    ) -> None:
+    ) -> int | None:
+        """Send all chunks to one chat and return the message_id of the final
+        chunk (the one that carries the keyboard). None if every send failed."""
+        last_id: int | None = None
         try:
             for i, chunk in enumerate(chunks):
-                await self.app.bot.send_message(
+                sent = await self.app.bot.send_message(
                     chat_id=chat_id,
                     text=chunk,
                     parse_mode=ParseMode.HTML,
                     disable_web_page_preview=disable_preview,
                     reply_markup=markup if i == len(chunks) - 1 else None,
                 )
+                last_id = sent.message_id
+            return last_id
         except Exception:
             log.exception("HTML send to %d failed; retrying as plain text", chat_id)
             try:
+                last_id = None
                 for i, chunk in enumerate(chunks):
-                    await self.app.bot.send_message(
+                    sent = await self.app.bot.send_message(
                         chat_id=chat_id,
                         text=_strip_html(chunk),
                         disable_web_page_preview=disable_preview,
                         reply_markup=markup if i == len(chunks) - 1 else None,
                     )
+                    last_id = sent.message_id
+                return last_id
             except Exception:
                 log.exception("plain-text fallback to %d also failed", chat_id)
+                return None
+
+    def _prune_digest_memory(self) -> None:
+        """Cap _digest_items at DIGEST_MEMORY_CAP entries — drop oldest by
+        message_id (Telegram message_ids are monotonic per chat but globally
+        ordered enough for a coarse FIFO eviction)."""
+        if len(self._digest_items) <= DIGEST_MEMORY_CAP:
+            return
+        for stale in sorted(self._digest_items)[:-DIGEST_MEMORY_CAP]:
+            del self._digest_items[stale]
 
     async def _unauthorized(self, update: Update, _: ContextTypes.DEFAULT_TYPE) -> None:
         user = update.effective_user
@@ -212,12 +246,17 @@ class Bot:
         )
 
     async def _on_feedback(self, update: Update, _: ContextTypes.DEFAULT_TYPE) -> None:
-        """Handle a thumbs button press from a digest message.
+        """Handle the two callback shapes attached to digest messages:
+          - 'fb:expand'                — swap the placeholder button for the
+                                         per-item thumbs keyboard
+          - 'fb:<article_id>:<+1|-1>' — record a thumbs vote for one article
 
-        callback_data shape: "fb:<article_id>:<+1|-1>". Authorisation is by user id
-        because callback queries don't go through the message filters; an attacker
-        replaying a callback they snooped from another chat would otherwise bypass
-        the chat allowlist entirely."""
+        Authorisation is by user id because callback queries don't go through
+        the message filters; an attacker replaying a callback they snooped
+        from another chat would otherwise bypass the chat allowlist entirely.
+        Telegram requires answering every callback query within 15s or the
+        loading spinner stays on the user's screen indefinitely — so always
+        answer, even on rejection."""
         query = update.callback_query
         if query is None:
             return
@@ -226,6 +265,9 @@ class Bot:
             log.info("rejecting feedback callback from non-allowlisted user %s", user_id)
             await query.answer("Not authorised.", show_alert=False)
             return
+        if query.data == EXPAND_CALLBACK:
+            await self._handle_expand(query)
+            return
         parsed = _parse_feedback_callback(query.data or "")
         if parsed is None:
             await query.answer("Bad button data.", show_alert=False)
@@ -233,10 +275,23 @@ class Bot:
         article_id, rating = parsed
         with connect(self.settings.db_path) as conn:
             record_feedback(conn, article_id, rating, None)
-        # Acknowledge in-place. Telegram requires answering every callback query
-        # within 15s or the loading spinner stays on the user's screen indefinitely.
         emoji = "👍" if rating > 0 else "👎"
         await query.answer(f"{emoji} recorded")
+
+    async def _handle_expand(self, query) -> None:  # type: ignore[no-untyped-def]
+        """Swap the 'Rate items' button for the full per-item keyboard. If we
+        no longer have items for this message (bot restart, very old digest
+        evicted by the memory cap), tell the user politely."""
+        message_id = query.message.message_id if query.message else None
+        items = self._digest_items.get(message_id) if message_id is not None else None
+        if items is None:
+            await query.answer(
+                "This digest is no longer rateable — bot may have restarted.",
+                show_alert=False,
+            )
+            return
+        await query.edit_message_reply_markup(reply_markup=_build_thumbs_keyboard(items))
+        await query.answer()
 
     async def _on_text(self, update: Update, _: ContextTypes.DEFAULT_TYPE) -> None:
         chat_id = update.effective_chat.id
@@ -283,19 +338,29 @@ def _strip_html(text: str) -> str:
     return text
 
 
+def _build_collapsed_keyboard() -> InlineKeyboardMarkup:
+    """Single-button 'Rate items' placeholder shown by default under a digest.
+    Tapping it fires fb:expand and the bot swaps in the full thumbs keyboard.
+    Keeps the digest's resting state clean rather than dumping a wall of
+    buttons under every message users may never engage with."""
+    return InlineKeyboardMarkup(
+        [[InlineKeyboardButton("👍 / 👎  Rate items", callback_data=EXPAND_CALLBACK)]]
+    )
+
+
 def _build_thumbs_keyboard(items: list[DigestItem]) -> InlineKeyboardMarkup:
-    """Compact 4-per-row layout: two items per row, each as [👍 N][👎 N]. Halves
-    keyboard height vs one-item-per-row while keeping per-item granularity.
-    Number labels match the digest's visible numbering. callback_data is bounded
-    to ~64 bytes by Telegram; article_ids are 16-char hex so we're well under."""
-    rows: list[list[InlineKeyboardButton]] = []
-    for i in range(0, len(items), 2):
-        row: list[InlineKeyboardButton] = []
-        for n, aid in items[i : i + 2]:
-            row.append(InlineKeyboardButton(f"👍 {n}", callback_data=f"{FEEDBACK_PREFIX}:{aid}:+1"))
-            row.append(InlineKeyboardButton(f"👎 {n}", callback_data=f"{FEEDBACK_PREFIX}:{aid}:-1"))
-        rows.append(row)
-    return InlineKeyboardMarkup(rows)
+    """Per-item rating layout shown after the user taps 'Rate items'.
+    One row per article: [👍 N][👎 N]. Tall but pairs each button unambiguously
+    to its article number — clearer than packing items 2-per-row."""
+    return InlineKeyboardMarkup(
+        [
+            [
+                InlineKeyboardButton(f"👍 {n}", callback_data=f"{FEEDBACK_PREFIX}:{aid}:+1"),
+                InlineKeyboardButton(f"👎 {n}", callback_data=f"{FEEDBACK_PREFIX}:{aid}:-1"),
+            ]
+            for n, aid in items
+        ]
+    )
 
 
 def _parse_feedback_callback(data: str) -> tuple[str, int] | None:
