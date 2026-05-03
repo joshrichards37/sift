@@ -17,16 +17,24 @@ from telegram.ext import (
 
 from sift.config import Preferences, Settings
 from sift.digest import (
+    SuggestionFooter,
     get_backlog_count,
     run_digest,
     run_more,
 )
 from sift.llm import LLM
-from sift.storage import connect, recent_articles, record_feedback
+from sift.storage import (
+    connect,
+    mark_suggestion_surfaced,
+    recent_articles,
+    record_feedback,
+    respond_to_suggestion,
+)
 
 DigestItem = tuple[int, str]  # (item number in the digest, article id)
 FEEDBACK_PREFIX = "fb"  # callback_data forms: fb:<article_id>:<+1|-1> | fb:expand
 EXPAND_CALLBACK = f"{FEEDBACK_PREFIX}:expand"
+SUGGESTION_PREFIX = "sg"  # callback_data form: sg:<suggestion_id>:<add|decline|mute>
 # Cap on stored digest→items state to prevent unbounded memory growth across
 # many days of digests. Tapping Rate on an older digest just returns "expired".
 DIGEST_MEMORY_CAP = 50
@@ -73,12 +81,21 @@ class Bot:
         self.app.add_handler(MessageHandler(auth & filters.TEXT & ~filters.COMMAND, self._on_text))
         # Inline-keyboard callbacks from the per-article thumbs buttons attached
         # to digest messages. CallbackQuery has no `from_user` filter form, so we
-        # gate inside the handler.
+        # gate inside each handler.
         self.app.add_handler(
             CallbackQueryHandler(self._on_feedback, pattern=rf"^{FEEDBACK_PREFIX}:")
         )
+        self.app.add_handler(
+            CallbackQueryHandler(self._on_suggestion, pattern=rf"^{SUGGESTION_PREFIX}:")
+        )
 
-    async def send_message_safe(self, text: str, *, items: list[DigestItem] | None = None) -> None:
+    async def send_message_safe(
+        self,
+        text: str,
+        *,
+        items: list[DigestItem] | None = None,
+        per_chat_suggestions: dict[int, SuggestionFooter] | None = None,
+    ) -> None:
         """Broadcast text to every authorized chat. HTML first, plain fallback per chat.
 
         If `items` is provided, the message is treated as a digest:
@@ -89,6 +106,11 @@ class Bot:
           - The items list is stashed against each broadcast's message_id so
             the expand callback can recover what to render
         Earlier chunks get no keyboard so the button stays anchored to the bottom.
+
+        If `per_chat_suggestions` is provided, after the broadcast each chat with
+        an entry gets a small follow-up message with the suggestion text and
+        Add/Decline/Mute buttons. Chats without a queued suggestion stay
+        single-message.
         """
         if self._paused:
             log.info("paused, dropping broadcast")
@@ -103,6 +125,11 @@ class Bot:
             if items and message_id is not None:
                 self._digest_items[message_id] = items
         self._prune_digest_memory()
+        for chat_id in self.settings.chat_ids:
+            suggestion = (per_chat_suggestions or {}).get(chat_id)
+            if suggestion is None:
+                continue
+            await self._send_suggestion_followup(chat_id, suggestion)
 
     async def _send_to_chat(
         self,
@@ -278,6 +305,83 @@ class Bot:
         emoji = "👍" if rating > 0 else "👎"
         await query.answer(f"{emoji} recorded")
 
+    async def _send_suggestion_followup(self, chat_id: int, suggestion: SuggestionFooter) -> None:
+        """Per-chat follow-up after the digest: 'we noticed you engage with X
+        — want to add it to your interests?' with three buttons. Marks the
+        suggestion as surfaced once Telegram accepts the send so we don't
+        re-surface a suggestion that failed to deliver."""
+        plural = "articles" if suggestion.evidence_count != 1 else "article"
+        text = (
+            f"💡 Suggested topic: <b>{escape(suggestion.topic)}</b>\n"
+            f"You've engaged with {suggestion.evidence_count} related {plural} recently."
+        )
+        keyboard = _build_suggestion_keyboard(suggestion.suggestion_id)
+        try:
+            await self.app.bot.send_message(
+                chat_id=chat_id,
+                text=text,
+                parse_mode=ParseMode.HTML,
+                disable_web_page_preview=True,
+                reply_markup=keyboard,
+            )
+        except Exception:
+            log.exception("suggestion follow-up to %d failed", chat_id)
+            return
+        with connect(self.settings.db_path) as conn:
+            mark_suggestion_surfaced(conn, suggestion.suggestion_id)
+
+    async def _on_suggestion(self, update: Update, _: ContextTypes.DEFAULT_TYPE) -> None:
+        """Handle Add/Decline/Mute on a suggestion follow-up message.
+
+        callback_data shape: 'sg:<suggestion_id>:<add|decline|mute>'.
+        On Add: record 'added', append the topic to in-memory prefs.topics so
+        the LLM uses it in the very next scoring call. The user is shown a
+        copy-pasteable snippet for their preferences.yaml so the change
+        survives a restart — we deliberately don't rewrite the file (it would
+        clobber hand-written comments) and the recommender's 'added' state
+        prevents re-suggesting the same topic next digest.
+        On Decline: 30-day cooldown (enforced by the recommender query).
+        On Mute: permanent block (enforced by last_response_for_topic check)."""
+        query = update.callback_query
+        if query is None:
+            return
+        user_id = query.from_user.id if query.from_user else None
+        if user_id not in self.settings.chat_ids:
+            log.info("rejecting suggestion callback from non-allowlisted user %s", user_id)
+            await query.answer("Not authorised.", show_alert=False)
+            return
+        parsed = _parse_suggestion_callback(query.data or "")
+        if parsed is None:
+            await query.answer("Bad button data.", show_alert=False)
+            return
+        sid, action = parsed
+        response = {"add": "added", "decline": "declined", "mute": "muted"}[action]
+        with connect(self.settings.db_path) as conn:
+            respond_to_suggestion(conn, sid, response)
+            row = conn.execute(
+                "SELECT topic FROM suggestion_candidates WHERE id = ?", (sid,)
+            ).fetchone()
+        topic = row["topic"] if row else "topic"
+        if action == "add":
+            # Mutate in-memory so the next score_relevance call sees it. The bullet
+            # format mirrors the topics block style users hand-write in prefs.
+            self.prefs.topics = f"{self.prefs.topics.rstrip()}\n  - {topic}"
+            ack = (
+                f"✓ Added <b>{escape(topic)}</b> to your interests for this session.\n\n"
+                f"To make permanent, add this line under <code>topics:</code> "
+                f"in <code>preferences.yaml</code>:\n"
+                f"<code>  - {escape(topic)}</code>"
+            )
+        elif action == "decline":
+            ack = f"OK — won't suggest <b>{escape(topic)}</b> again for ~30 days."
+        else:  # mute
+            ack = f"🔇 Muted — won't suggest <b>{escape(topic)}</b> again."
+        try:
+            await query.edit_message_text(text=ack, parse_mode=ParseMode.HTML)
+        except Exception:
+            log.exception("editing suggestion message after %s failed", action)
+        await query.answer()
+
     async def _handle_expand(self, query) -> None:  # type: ignore[no-untyped-def]
         """Swap the 'Rate items' button for the full per-item keyboard. If we
         no longer have items for this message (bot restart, very old digest
@@ -376,3 +480,37 @@ def _parse_feedback_callback(data: str) -> tuple[str, int] | None:
     if parts[2] == "-1":
         return article_id, -1
     return None
+
+
+def _build_suggestion_keyboard(suggestion_id: int) -> InlineKeyboardMarkup:
+    """Three-button row under a suggestion follow-up: Add / Decline / Mute.
+    Compact single row — the message text already explains what's being suggested."""
+    return InlineKeyboardMarkup(
+        [
+            [
+                InlineKeyboardButton(
+                    "➕ Add", callback_data=f"{SUGGESTION_PREFIX}:{suggestion_id}:add"
+                ),
+                InlineKeyboardButton(
+                    "👎 No", callback_data=f"{SUGGESTION_PREFIX}:{suggestion_id}:decline"
+                ),
+                InlineKeyboardButton(
+                    "🔇 Mute", callback_data=f"{SUGGESTION_PREFIX}:{suggestion_id}:mute"
+                ),
+            ]
+        ]
+    )
+
+
+def _parse_suggestion_callback(data: str) -> tuple[int, str] | None:
+    """Decode 'sg:<suggestion_id>:<add|decline|mute>' → (id, action). None on malformed."""
+    parts = data.split(":")
+    if len(parts) != 3 or parts[0] != SUGGESTION_PREFIX:
+        return None
+    try:
+        sid = int(parts[1])
+    except ValueError:
+        return None
+    if parts[2] not in ("add", "decline", "mute"):
+        return None
+    return sid, parts[2]

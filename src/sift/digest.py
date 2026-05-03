@@ -1,8 +1,10 @@
 from __future__ import annotations
 
 import asyncio
+import json
 import logging
 import sqlite3
+from dataclasses import dataclass
 from datetime import datetime, timedelta
 from html import escape
 from typing import Protocol
@@ -14,6 +16,7 @@ from sift.storage import (
     count_unpushed,
     fetch_top_unpushed,
     mark_many_pushed,
+    pending_suggestion_for,
 )
 
 log = logging.getLogger(__name__)
@@ -23,11 +26,29 @@ DigestItem = tuple[int, str]  # mirrors telegram_bot.DigestItem; kept duplicate 
 # avoid digest.py importing the telegram package.
 
 
+@dataclass(frozen=True, slots=True)
+class SuggestionFooter:
+    """Per-chat snapshot of a pending suggestion. The bot uses these fields to
+    build the suggestion follow-up message after broadcasting the digest."""
+
+    suggestion_id: int
+    topic: str
+    evidence_count: int
+
+
 class SendText(Protocol):
     """Broadcast callable. `items` is optional — when provided, the underlying
-    bot attaches a per-article thumbs keyboard to the final chunk of the message."""
+    bot attaches a per-article thumbs keyboard to the final chunk of the message.
+    `per_chat_suggestions` triggers a per-chat follow-up suggestion message
+    (Add/Decline/Mute buttons) only for chats that have a pending suggestion."""
 
-    async def __call__(self, text: str, *, items: list[DigestItem] | None = None) -> None: ...
+    async def __call__(
+        self,
+        text: str,
+        *,
+        items: list[DigestItem] | None = None,
+        per_chat_suggestions: dict[int, SuggestionFooter] | None = None,
+    ) -> None: ...
 
 
 async def digest_loop(settings: Settings, prefs: Preferences, send: SendText) -> None:
@@ -72,7 +93,11 @@ def populate_suggestions(settings: Settings, prefs: Preferences) -> int:
 
 
 async def run_digest(settings: Settings, prefs: Preferences, send: SendText) -> int:
-    """Send the daily digest. Returns the number of articles included (0 if quiet)."""
+    """Send the daily digest. Returns the number of articles included (0 if quiet).
+
+    If any chat has a pending taste-discovery suggestion, attach it as a per-chat
+    follow-up — sent only to chats with one queued, so chats without one stay
+    single-message."""
     with connect(settings.db_path) as conn:
         rows = fetch_top_unpushed(
             conn,
@@ -85,11 +110,38 @@ async def run_digest(settings: Settings, prefs: Preferences, send: SendText) -> 
         return 0
     msg = format_digest(rows, header="📰 Daily Digest")
     items = _build_thumbs_items(rows)
-    await send(msg, items=items)
+    suggestions = fetch_pending_suggestions(settings)
+    await send(msg, items=items, per_chat_suggestions=suggestions)
     with connect(settings.db_path) as conn:
         mark_many_pushed(conn, [r["id"] for r in rows])
-    log.info("digest: sent %d articles", len(rows))
+    log.info(
+        "digest: sent %d articles, %d suggestion follow-ups",
+        len(rows),
+        len(suggestions),
+    )
     return len(rows)
+
+
+def fetch_pending_suggestions(settings: Settings) -> dict[int, SuggestionFooter]:
+    """Snapshot the highest-confidence pending suggestion per authorised chat.
+    Empty dict when nobody has one queued — that's the common case, since the
+    recommender is gated on engagement signal that takes days to accumulate."""
+    out: dict[int, SuggestionFooter] = {}
+    with connect(settings.db_path) as conn:
+        for chat_id in settings.chat_ids:
+            row = pending_suggestion_for(conn, str(chat_id))
+            if row is None:
+                continue
+            try:
+                evidence = json.loads(row["evidence_article_ids"] or "[]")
+            except json.JSONDecodeError:
+                evidence = []
+            out[chat_id] = SuggestionFooter(
+                suggestion_id=row["id"],
+                topic=row["topic"],
+                evidence_count=len(evidence) if isinstance(evidence, list) else 0,
+            )
+    return out
 
 
 async def run_more(settings: Settings, prefs: Preferences, send: SendText, n: int) -> int:

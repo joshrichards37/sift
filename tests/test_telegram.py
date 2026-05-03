@@ -12,9 +12,11 @@ from sift.telegram_bot import (
     EXPAND_CALLBACK,
     Bot,
     _build_collapsed_keyboard,
+    _build_suggestion_keyboard,
     _build_thumbs_keyboard,
     _chunk,
     _parse_feedback_callback,
+    _parse_suggestion_callback,
 )
 
 LIMIT = 4096  # Telegram message size limit
@@ -325,3 +327,174 @@ def test_prune_digest_memory_drops_oldest(
     assert len(bot._digest_items) == DIGEST_MEMORY_CAP
     # The oldest 5 (lowest message_ids) should be gone.
     assert min(bot._digest_items) == 5
+
+
+# --- Suggestion keyboard + parser ---
+
+
+def test_build_suggestion_keyboard_three_buttons() -> None:
+    """One row, three buttons: Add / Decline / Mute. callback_data encodes the
+    suggestion id so the handler can resolve it back to a row."""
+    kb = _build_suggestion_keyboard(suggestion_id=42)
+    assert len(kb.inline_keyboard) == 1
+    assert len(kb.inline_keyboard[0]) == 3
+    assert kb.inline_keyboard[0][0].callback_data == "sg:42:add"
+    assert kb.inline_keyboard[0][1].callback_data == "sg:42:decline"
+    assert kb.inline_keyboard[0][2].callback_data == "sg:42:mute"
+
+
+def test_parse_suggestion_callback_round_trips() -> None:
+    assert _parse_suggestion_callback("sg:7:add") == (7, "add")
+    assert _parse_suggestion_callback("sg:99:decline") == (99, "decline")
+    assert _parse_suggestion_callback("sg:1:mute") == (1, "mute")
+
+
+def test_parse_suggestion_callback_rejects_malformed() -> None:
+    """Non-int id, unknown action, wrong prefix, wrong arity all → None."""
+    assert _parse_suggestion_callback("sg:abc:add") is None
+    assert _parse_suggestion_callback("sg:1:upvote") is None
+    assert _parse_suggestion_callback("xx:1:add") is None
+    assert _parse_suggestion_callback("sg:1") is None
+    assert _parse_suggestion_callback("sg:1:add:extra") is None
+
+
+# --- Suggestion callback handler ---
+
+
+async def _seed_suggestion(db: Path, *, chat_id: str, topic: str) -> int:
+    """Helper: insert a pending suggestion_candidates row and return its id."""
+    from sift.storage import record_suggestion_candidate
+
+    with connect(db) as conn:
+        return record_suggestion_candidate(
+            conn,
+            chat_id=chat_id,
+            topic=topic,
+            confidence=0.8,
+            evidence_article_ids=["a1", "a2", "a3"],
+        )
+
+
+async def test_on_suggestion_add_records_added_and_updates_in_memory_prefs(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    """Add appends to in-memory prefs.topics so the LLM uses the new topic in
+    the very next score call. Persistence to preferences.yaml is left to the
+    user (acknowledgment shows a copy-pasteable snippet) to avoid clobbering
+    hand-written comments in their file."""
+    from sift.storage import last_response_for_topic
+
+    db = tmp_path / "test.db"
+    init_db(db)
+    sid = await _seed_suggestion(db, chat_id="42", topic="post-training")
+    bot = _make_bot(monkeypatch, db)
+    original_topics = bot.prefs.topics
+    edit = AsyncMock()
+    answer = AsyncMock()
+    update = SimpleNamespace(
+        callback_query=SimpleNamespace(
+            from_user=SimpleNamespace(id=42),
+            data=f"sg:{sid}:add",
+            edit_message_text=edit,
+            answer=answer,
+        )
+    )
+    await bot._on_suggestion(update, None)
+    # Storage state: response recorded as 'added'.
+    with connect(db) as conn:
+        last = last_response_for_topic(conn, chat_id="42", topic="post-training")
+    assert last is not None
+    assert last["response"] == "added"
+    # In-memory prefs include the new topic now.
+    assert "post-training" in bot.prefs.topics
+    assert bot.prefs.topics != original_topics
+    # User got an acknowledgment with the copy-pasteable snippet.
+    edit.assert_awaited_once()
+    ack_text = edit.await_args.kwargs["text"]
+    assert "Added" in ack_text and "post-training" in ack_text
+    assert "preferences.yaml" in ack_text
+    answer.assert_awaited_once()
+
+
+async def test_on_suggestion_decline_records_declined(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    """Decline records 'declined' (recommender enforces 30-day cooldown).
+    In-memory prefs are unchanged."""
+    from sift.storage import last_response_for_topic
+
+    db = tmp_path / "test.db"
+    init_db(db)
+    sid = await _seed_suggestion(db, chat_id="42", topic="crypto")
+    bot = _make_bot(monkeypatch, db)
+    before = bot.prefs.topics
+    update = SimpleNamespace(
+        callback_query=SimpleNamespace(
+            from_user=SimpleNamespace(id=42),
+            data=f"sg:{sid}:decline",
+            edit_message_text=AsyncMock(),
+            answer=AsyncMock(),
+        )
+    )
+    await bot._on_suggestion(update, None)
+    with connect(db) as conn:
+        last = last_response_for_topic(conn, chat_id="42", topic="crypto")
+    assert last is not None
+    assert last["response"] == "declined"
+    assert bot.prefs.topics == before  # decline must not pollute prefs
+
+
+async def test_on_suggestion_mute_records_muted(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    """Mute records 'muted' (recommender treats this as permanent — 'Mute
+    permanently must actually mean it' was the explicit design constraint)."""
+    from sift.storage import last_response_for_topic
+
+    db = tmp_path / "test.db"
+    init_db(db)
+    sid = await _seed_suggestion(db, chat_id="42", topic="nfts")
+    bot = _make_bot(monkeypatch, db)
+    update = SimpleNamespace(
+        callback_query=SimpleNamespace(
+            from_user=SimpleNamespace(id=42),
+            data=f"sg:{sid}:mute",
+            edit_message_text=AsyncMock(),
+            answer=AsyncMock(),
+        )
+    )
+    await bot._on_suggestion(update, None)
+    with connect(db) as conn:
+        last = last_response_for_topic(conn, chat_id="42", topic="nfts")
+    assert last is not None
+    assert last["response"] == "muted"
+
+
+async def test_on_suggestion_rejects_unauthorised_user(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    """Same security boundary as the thumbs handler: callback_query bypasses
+    the message-level chat allowlist filter, so the handler MUST re-check user_id."""
+    db = tmp_path / "test.db"
+    init_db(db)
+    sid = await _seed_suggestion(db, chat_id="42", topic="x")
+    bot = _make_bot(monkeypatch, db)
+    edit = AsyncMock()
+    answer = AsyncMock()
+    update = SimpleNamespace(
+        callback_query=SimpleNamespace(
+            from_user=SimpleNamespace(id=999),  # not on allowlist
+            data=f"sg:{sid}:add",
+            edit_message_text=edit,
+            answer=answer,
+        )
+    )
+    await bot._on_suggestion(update, None)
+    edit.assert_not_awaited()
+    answer.assert_awaited_once()
+    # No response recorded — db state unchanged
+    with connect(db) as conn:
+        row = conn.execute(
+            "SELECT response FROM suggestion_candidates WHERE id = ?", (sid,)
+        ).fetchone()
+    assert row["response"] is None
