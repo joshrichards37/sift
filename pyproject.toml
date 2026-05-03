@@ -31,6 +31,7 @@ dependencies = [
 [project.scripts]
 sift = "sift.main:run"
 sift-setup = "sift.wizard:main"
+sift-bench = "sift.bench:run"
 
 [build-system]
 requires = ["hatchling"]
