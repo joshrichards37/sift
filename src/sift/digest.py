@@ -9,7 +9,9 @@ from datetime import datetime, timedelta
 from html import escape
 from typing import Protocol
 
+from sift.adjacency import suggest_for_chat_via_adjacency
 from sift.config import Preferences, Settings
+from sift.llm import LLM
 from sift.recommender import record_for_chat, suggest_for_chat
 from sift.storage import (
     connect,
@@ -51,7 +53,7 @@ class SendText(Protocol):
     ) -> None: ...
 
 
-async def digest_loop(settings: Settings, prefs: Preferences, send: SendText) -> None:
+async def digest_loop(settings: Settings, prefs: Preferences, llm: LLM, send: SendText) -> None:
     """Sleeps until the next digest_time, then sends; repeats forever."""
     while True:
         next_run = _next_digest_time(prefs.digest_time)
@@ -59,37 +61,67 @@ async def digest_loop(settings: Settings, prefs: Preferences, send: SendText) ->
         log.info("next digest at %s (in %.0f min)", next_run.isoformat(), sleep_s / 60)
         await asyncio.sleep(sleep_s)
         try:
-            populate_suggestions(settings, prefs)
+            await populate_suggestions(settings, prefs, llm)
             await run_digest(settings, prefs, send)
         except Exception:
             log.exception("digest failed")
 
 
-def populate_suggestions(settings: Settings, prefs: Preferences) -> int:
-    """Run the taste-discovery suggester for each authorised chat and record
-    any qualifying suggestion. Returns the count recorded.
+async def populate_suggestions(settings: Settings, prefs: Preferences, llm: LLM) -> int:
+    """Run both recommendation mechanisms per authorised chat. Returns the count
+    of suggestions recorded across all chats this cycle.
 
-    Idempotent at the per-chat level — if a chat already has a pending
-    (un-responded) suggestion, the digest UX layer surfaces that one and
-    the recommender is free to add another. We don't dedupe here because
-    the storage layer enforces 'one pending shown at a time' via the query
-    in pending_suggestion_for, and the per-chat mute/decline checks in the
-    suggester prevent re-suggesting topics the user has already rejected."""
+    Coexistence rules:
+      1. In-domain suggester runs first — higher signal (validated by thumbs).
+         If it returns a candidate, record it and skip adjacency for this chat.
+      2. Otherwise, fall back to LLM-driven adjacency. Adjacency itself enforces
+         a global per-chat cadence cap (~weekly) since the LLM has unlimited
+         supply and would otherwise produce a 'want to explore X?' footer
+         every digest.
+      3. If neither mechanism produces a candidate, the chat gets no suggestion
+         this cycle — the digest UX surfaces nothing.
+
+    Per-chat failures don't block other chats — wrap each in try/except so a
+    transient LLM hiccup for one chat doesn't break the digest for the rest."""
     recorded = 0
     with connect(settings.db_path) as conn:
         for chat_id in settings.chat_ids:
-            suggestion = suggest_for_chat(conn, chat_id=str(chat_id), prefs_topics=prefs.topics)
-            if suggestion is None:
-                continue
-            record_for_chat(conn, chat_id=str(chat_id), suggestion=suggestion)
-            log.info(
-                "recorded suggestion for chat %s: topic=%r confidence=%.2f",
-                chat_id,
-                suggestion.topic,
-                suggestion.confidence,
-            )
-            recorded += 1
+            try:
+                if await _populate_one(conn, chat_id=chat_id, prefs=prefs, llm=llm):
+                    recorded += 1
+            except Exception:
+                log.exception("populating suggestions for chat %s failed", chat_id)
     return recorded
+
+
+async def _populate_one(
+    conn: sqlite3.Connection, *, chat_id: int, prefs: Preferences, llm: LLM
+) -> bool:
+    """Try in-domain → adjacency for one chat. Returns True if a suggestion
+    was recorded."""
+    chat_id_str = str(chat_id)
+    in_domain = suggest_for_chat(conn, chat_id=chat_id_str, prefs_topics=prefs.topics)
+    if in_domain is not None:
+        record_for_chat(conn, chat_id=chat_id_str, suggestion=in_domain)
+        log.info(
+            "recorded in-domain suggestion for chat %s: topic=%r confidence=%.2f",
+            chat_id,
+            in_domain.topic,
+            in_domain.confidence,
+        )
+        return True
+    adjacency = await suggest_for_chat_via_adjacency(
+        llm, conn, chat_id=chat_id_str, prefs_topics=prefs.topics
+    )
+    if adjacency is not None:
+        record_for_chat(conn, chat_id=chat_id_str, suggestion=adjacency)
+        log.info(
+            "recorded adjacency suggestion for chat %s: topic=%r",
+            chat_id,
+            adjacency.topic,
+        )
+        return True
+    return False
 
 
 async def run_digest(settings: Settings, prefs: Preferences, send: SendText) -> int:

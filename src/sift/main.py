@@ -38,7 +38,7 @@ async def _main() -> None:
     try:
         await asyncio.gather(
             run_scheduler(sources, settings, prefs, llm),
-            digest_loop(settings, prefs, bot.send_message_safe),
+            digest_loop(settings, prefs, llm, bot.send_message_safe),
         )
     finally:
         await bot.app.updater.stop()
