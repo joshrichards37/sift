@@ -98,7 +98,7 @@ def suggest_for_chat(
         positive_ratio = len(positive) / n
         if positive_ratio < min_positive_ratio:
             continue
-        if _topic_blocked_by_prior_response(
+        if topic_blocked_by_prior_response(
             conn,
             chat_id=chat_id,
             topic=tag,
@@ -131,7 +131,7 @@ def record_for_chat(conn: sqlite3.Connection, *, chat_id: str, suggestion: Sugge
     )
 
 
-def _topic_blocked_by_prior_response(
+def topic_blocked_by_prior_response(
     conn: sqlite3.Connection,
     *,
     chat_id: str,
