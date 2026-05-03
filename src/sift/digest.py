@@ -3,9 +3,9 @@ from __future__ import annotations
 import asyncio
 import logging
 import sqlite3
-from collections.abc import Awaitable, Callable
 from datetime import datetime, timedelta
 from html import escape
+from typing import Protocol
 
 from sift.config import Preferences, Settings
 from sift.recommender import record_for_chat, suggest_for_chat
@@ -19,7 +19,15 @@ from sift.storage import (
 log = logging.getLogger(__name__)
 
 
-SendText = Callable[[str], Awaitable[None]]
+DigestItem = tuple[int, str]  # mirrors telegram_bot.DigestItem; kept duplicate to
+# avoid digest.py importing the telegram package.
+
+
+class SendText(Protocol):
+    """Broadcast callable. `items` is optional — when provided, the underlying
+    bot attaches a per-article thumbs keyboard to the final chunk of the message."""
+
+    async def __call__(self, text: str, *, items: list[DigestItem] | None = None) -> None: ...
 
 
 async def digest_loop(settings: Settings, prefs: Preferences, send: SendText) -> None:
@@ -76,7 +84,8 @@ async def run_digest(settings: Settings, prefs: Preferences, send: SendText) -> 
         await send(_no_news_message())
         return 0
     msg = format_digest(rows, header="📰 Daily Digest")
-    await send(msg)
+    items = _build_thumbs_items(rows)
+    await send(msg, items=items)
     with connect(settings.db_path) as conn:
         mark_many_pushed(conn, [r["id"] for r in rows])
     log.info("digest: sent %d articles", len(rows))
@@ -91,10 +100,18 @@ async def run_more(settings: Settings, prefs: Preferences, send: SendText, n: in
         await send("Nothing left in the backlog above threshold. Wait for the next digest.")
         return 0
     msg = format_digest(rows, header=f"More from backlog ({len(rows)})")
-    await send(msg)
+    items = _build_thumbs_items(rows)
+    await send(msg, items=items)
     with connect(settings.db_path) as conn:
         mark_many_pushed(conn, [r["id"] for r in rows])
     return len(rows)
+
+
+def _build_thumbs_items(rows: list[sqlite3.Row]) -> list[DigestItem]:
+    """Pair each digest item's visible 1-based index with its article id so the
+    bot can build the thumbs keyboard. Numbering matches format_digest's
+    enumerate(rows, 1)."""
+    return [(i, r["id"]) for i, r in enumerate(rows, 1)]
 
 
 def get_backlog_count(settings: Settings, prefs: Preferences) -> int:

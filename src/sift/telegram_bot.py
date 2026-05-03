@@ -4,10 +4,11 @@ import logging
 from collections import defaultdict, deque
 from html import escape
 
-from telegram import Update
+from telegram import InlineKeyboardButton, InlineKeyboardMarkup, Update
 from telegram.constants import ParseMode
 from telegram.ext import (
     Application,
+    CallbackQueryHandler,
     CommandHandler,
     ContextTypes,
     MessageHandler,
@@ -21,7 +22,10 @@ from sift.digest import (
     run_more,
 )
 from sift.llm import LLM
-from sift.storage import connect, recent_articles
+from sift.storage import connect, recent_articles, record_feedback
+
+DigestItem = tuple[int, str]  # (item number in the digest, article id)
+FEEDBACK_PREFIX = "fb"  # callback_data form: fb:<article_id>:<+1|-1>
 
 log = logging.getLogger(__name__)
 
@@ -59,33 +63,53 @@ class Bot:
         self.app.add_handler(CommandHandler("backlog", self._backlog, filters=auth))
         self.app.add_handler(CommandHandler("recent", self._recent, filters=auth))
         self.app.add_handler(MessageHandler(auth & filters.TEXT & ~filters.COMMAND, self._on_text))
+        # Inline-keyboard callbacks from the per-article thumbs buttons attached
+        # to digest messages. CallbackQuery has no `from_user` filter form, so we
+        # gate inside the handler.
+        self.app.add_handler(
+            CallbackQueryHandler(self._on_feedback, pattern=rf"^{FEEDBACK_PREFIX}:")
+        )
 
-    async def send_message_safe(self, text: str) -> None:
-        """Broadcast text to every authorized chat. HTML first, plain fallback per chat."""
+    async def send_message_safe(self, text: str, *, items: list[DigestItem] | None = None) -> None:
+        """Broadcast text to every authorized chat. HTML first, plain fallback per chat.
+
+        If `items` is provided, attach a thumbs-up/down keyboard to the final chunk
+        of the broadcast — one row per item, two buttons per row. Earlier chunks
+        (only relevant when the digest exceeds Telegram's 4096-char limit) get no
+        keyboard so the buttons stay anchored to the bottom of the visible message.
+        """
         if self._paused:
             log.info("paused, dropping broadcast")
             return
         chunks = _chunk(text, TG_MSG_LIMIT)
+        markup = _build_thumbs_keyboard(items) if items else None
         for chat_id in self.settings.chat_ids:
-            await self._send_to_chat(chat_id, chunks)
+            await self._send_to_chat(chat_id, chunks, markup)
 
-    async def _send_to_chat(self, chat_id: int, chunks: list[str]) -> None:
+    async def _send_to_chat(
+        self,
+        chat_id: int,
+        chunks: list[str],
+        markup: InlineKeyboardMarkup | None = None,
+    ) -> None:
         try:
-            for chunk in chunks:
+            for i, chunk in enumerate(chunks):
                 await self.app.bot.send_message(
                     chat_id=chat_id,
                     text=chunk,
                     parse_mode=ParseMode.HTML,
                     disable_web_page_preview=False,
+                    reply_markup=markup if i == len(chunks) - 1 else None,
                 )
         except Exception:
             log.exception("HTML send to %d failed; retrying as plain text", chat_id)
             try:
-                for chunk in chunks:
+                for i, chunk in enumerate(chunks):
                     await self.app.bot.send_message(
                         chat_id=chat_id,
                         text=_strip_html(chunk),
                         disable_web_page_preview=False,
+                        reply_markup=markup if i == len(chunks) - 1 else None,
                     )
             except Exception:
                 log.exception("plain-text fallback to %d also failed", chat_id)
@@ -183,6 +207,33 @@ class Bot:
             "\n".join(lines), parse_mode=ParseMode.HTML, disable_web_page_preview=True
         )
 
+    async def _on_feedback(self, update: Update, _: ContextTypes.DEFAULT_TYPE) -> None:
+        """Handle a thumbs button press from a digest message.
+
+        callback_data shape: "fb:<article_id>:<+1|-1>". Authorisation is by user id
+        because callback queries don't go through the message filters; an attacker
+        replaying a callback they snooped from another chat would otherwise bypass
+        the chat allowlist entirely."""
+        query = update.callback_query
+        if query is None:
+            return
+        user_id = query.from_user.id if query.from_user else None
+        if user_id not in self.settings.chat_ids:
+            log.info("rejecting feedback callback from non-allowlisted user %s", user_id)
+            await query.answer("Not authorised.", show_alert=False)
+            return
+        parsed = _parse_feedback_callback(query.data or "")
+        if parsed is None:
+            await query.answer("Bad button data.", show_alert=False)
+            return
+        article_id, rating = parsed
+        with connect(self.settings.db_path) as conn:
+            record_feedback(conn, article_id, rating, None)
+        # Acknowledge in-place. Telegram requires answering every callback query
+        # within 15s or the loading spinner stays on the user's screen indefinitely.
+        emoji = "👍" if rating > 0 else "👎"
+        await query.answer(f"{emoji} recorded")
+
     async def _on_text(self, update: Update, _: ContextTypes.DEFAULT_TYPE) -> None:
         chat_id = update.effective_chat.id
         history = self._chat_history[chat_id]
@@ -226,3 +277,32 @@ def _strip_html(text: str) -> str:
     text = re.sub(r"<a[^>]*href=\"([^\"]*)\"[^>]*>(.*?)</a>", r"\2 (\1)", text)
     text = re.sub(r"<[^>]+>", "", text)
     return text
+
+
+def _build_thumbs_keyboard(items: list[DigestItem]) -> InlineKeyboardMarkup:
+    """One row of [👍 N][👎 N] per digest item — N is the digest's visible numbering.
+    callback_data is bounded to ~64 bytes by Telegram; article_ids are 16-char
+    hex from storage.article_id() so we're well under the limit."""
+    rows = [
+        [
+            InlineKeyboardButton(f"👍 {n}", callback_data=f"{FEEDBACK_PREFIX}:{aid}:+1"),
+            InlineKeyboardButton(f"👎 {n}", callback_data=f"{FEEDBACK_PREFIX}:{aid}:-1"),
+        ]
+        for n, aid in items
+    ]
+    return InlineKeyboardMarkup(rows)
+
+
+def _parse_feedback_callback(data: str) -> tuple[str, int] | None:
+    """Decode 'fb:<article_id>:<+1|-1>' → (article_id, rating). None on malformed input."""
+    parts = data.split(":")
+    if len(parts) != 3 or parts[0] != FEEDBACK_PREFIX:
+        return None
+    article_id = parts[1]
+    if not article_id:
+        return None
+    if parts[2] == "+1":
+        return article_id, 1
+    if parts[2] == "-1":
+        return article_id, -1
+    return None
