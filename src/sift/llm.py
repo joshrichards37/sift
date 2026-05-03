@@ -30,13 +30,12 @@ Reply with strict JSON only:
 No markdown, no preamble."""
 
 
-SUMMARY_SYSTEM = """You write executive summaries for a busy technical reader.
+SUMMARY_SYSTEM = """You write the shortest possible summary of an article that conveys what matters.
 
-- {target_words} words, ±20%.
-- Lead with the single most important takeaway.
-- Concrete details over generalities. If the article announces a feature, name it.
-- No filler ("In this article…", "The author argues…"). Just the substance.
-- Plain prose, no bullets unless the article is itself a list of items."""
+- Hard ceiling: {target_words} words. Stop when you hit it; never go over.
+- Lead with the single most important fact. If the article announces a thing, name it.
+- Paraphrase, don't quote. Don't lift sentences from the article body.
+- No filler ("In this article…", "The author argues…", "explores how…"). Just the substance."""
 
 
 @dataclass(slots=True)

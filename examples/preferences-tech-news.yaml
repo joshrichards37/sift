@@ -30,7 +30,7 @@ exclude_keywords:
   - celebrity
 
 relevance_threshold: 7
-summary_target_words: 80
+summary_target_words: 50
 max_per_cycle: 3
 
 digest_time: "09:00"

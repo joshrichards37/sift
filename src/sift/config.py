@@ -68,7 +68,7 @@ class Preferences(BaseModel):
     topics: str
     exclude_keywords: list[str] = Field(default_factory=list)
     relevance_threshold: int = 7
-    summary_target_words: int = 80
+    summary_target_words: int = 50
     max_per_cycle: int = 3  # cap of LLM scoring calls per source per poll
     digest_time: str = "09:00"  # HH:MM local time the daily digest fires
     digest_size: int = 10  # top N articles per digest
