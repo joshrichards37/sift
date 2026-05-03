@@ -73,24 +73,28 @@ class Bot:
     async def send_message_safe(self, text: str, *, items: list[DigestItem] | None = None) -> None:
         """Broadcast text to every authorized chat. HTML first, plain fallback per chat.
 
-        If `items` is provided, attach a thumbs-up/down keyboard to the final chunk
-        of the broadcast — one row per item, two buttons per row. Earlier chunks
-        (only relevant when the digest exceeds Telegram's 4096-char limit) get no
-        keyboard so the buttons stay anchored to the bottom of the visible message.
+        If `items` is provided, attach a thumbs keyboard to the final chunk and
+        disable URL previews — digests carry many URLs and Telegram would
+        otherwise render a huge preview card per chunk, breaking the visual flow
+        with embedded Reddit/YouTube/GitHub panels mid-message. Earlier chunks
+        get no keyboard so the buttons stay anchored to the bottom.
         """
         if self._paused:
             log.info("paused, dropping broadcast")
             return
         chunks = _chunk(text, TG_MSG_LIMIT)
+        is_digest = items is not None
         markup = _build_thumbs_keyboard(items) if items else None
         for chat_id in self.settings.chat_ids:
-            await self._send_to_chat(chat_id, chunks, markup)
+            await self._send_to_chat(chat_id, chunks, markup, disable_preview=is_digest)
 
     async def _send_to_chat(
         self,
         chat_id: int,
         chunks: list[str],
         markup: InlineKeyboardMarkup | None = None,
+        *,
+        disable_preview: bool = False,
     ) -> None:
         try:
             for i, chunk in enumerate(chunks):
@@ -98,7 +102,7 @@ class Bot:
                     chat_id=chat_id,
                     text=chunk,
                     parse_mode=ParseMode.HTML,
-                    disable_web_page_preview=False,
+                    disable_web_page_preview=disable_preview,
                     reply_markup=markup if i == len(chunks) - 1 else None,
                 )
         except Exception:
@@ -108,7 +112,7 @@ class Bot:
                     await self.app.bot.send_message(
                         chat_id=chat_id,
                         text=_strip_html(chunk),
-                        disable_web_page_preview=False,
+                        disable_web_page_preview=disable_preview,
                         reply_markup=markup if i == len(chunks) - 1 else None,
                     )
             except Exception:
@@ -280,16 +284,17 @@ def _strip_html(text: str) -> str:
 
 
 def _build_thumbs_keyboard(items: list[DigestItem]) -> InlineKeyboardMarkup:
-    """One row of [👍 N][👎 N] per digest item — N is the digest's visible numbering.
-    callback_data is bounded to ~64 bytes by Telegram; article_ids are 16-char
-    hex from storage.article_id() so we're well under the limit."""
-    rows = [
-        [
-            InlineKeyboardButton(f"👍 {n}", callback_data=f"{FEEDBACK_PREFIX}:{aid}:+1"),
-            InlineKeyboardButton(f"👎 {n}", callback_data=f"{FEEDBACK_PREFIX}:{aid}:-1"),
-        ]
-        for n, aid in items
-    ]
+    """Compact 4-per-row layout: two items per row, each as [👍 N][👎 N]. Halves
+    keyboard height vs one-item-per-row while keeping per-item granularity.
+    Number labels match the digest's visible numbering. callback_data is bounded
+    to ~64 bytes by Telegram; article_ids are 16-char hex so we're well under."""
+    rows: list[list[InlineKeyboardButton]] = []
+    for i in range(0, len(items), 2):
+        row: list[InlineKeyboardButton] = []
+        for n, aid in items[i : i + 2]:
+            row.append(InlineKeyboardButton(f"👍 {n}", callback_data=f"{FEEDBACK_PREFIX}:{aid}:+1"))
+            row.append(InlineKeyboardButton(f"👎 {n}", callback_data=f"{FEEDBACK_PREFIX}:{aid}:-1"))
+        rows.append(row)
     return InlineKeyboardMarkup(rows)
 
 

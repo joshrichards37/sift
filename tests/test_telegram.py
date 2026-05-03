@@ -91,17 +91,30 @@ def test_chunk_prefers_paragraph_then_line_then_hard_cut() -> None:
 # --- Thumbs keyboard ---
 
 
-def test_build_thumbs_keyboard_one_row_per_item() -> None:
-    """n digest items → n rows, 2 buttons each. Number labels match the digest's
-    visible 1-based numbering so users can pair the button to the item."""
+def test_build_thumbs_keyboard_four_buttons_per_row() -> None:
+    """Compact layout: two items packed per row, each as [👍 N][👎 N]. Halves
+    keyboard height vs one-item-per-row. Last row may be 2 buttons if items is odd."""
     items = [(1, "aaa"), (2, "bbb"), (3, "ccc")]
     kb = _build_thumbs_keyboard(items)
-    assert len(kb.inline_keyboard) == 3
-    for row in kb.inline_keyboard:
-        assert len(row) == 2
+    assert len(kb.inline_keyboard) == 2  # ceil(3 / 2)
+    # First row packs items 1 and 2 → 4 buttons
+    assert len(kb.inline_keyboard[0]) == 4
     assert kb.inline_keyboard[0][0].text == "👍 1"
     assert kb.inline_keyboard[0][1].text == "👎 1"
-    assert kb.inline_keyboard[2][0].text == "👍 3"
+    assert kb.inline_keyboard[0][2].text == "👍 2"
+    assert kb.inline_keyboard[0][3].text == "👎 2"
+    # Second row only has item 3 → 2 buttons
+    assert len(kb.inline_keyboard[1]) == 2
+    assert kb.inline_keyboard[1][0].text == "👍 3"
+    assert kb.inline_keyboard[1][1].text == "👎 3"
+
+
+def test_build_thumbs_keyboard_full_ten_items_packs_to_five_rows() -> None:
+    """The default digest_size=10 case — 10 items pack into exactly 5 rows of 4."""
+    items = [(i, f"id{i}") for i in range(1, 11)]
+    kb = _build_thumbs_keyboard(items)
+    assert len(kb.inline_keyboard) == 5
+    assert all(len(row) == 4 for row in kb.inline_keyboard)
 
 
 def test_build_thumbs_keyboard_callback_data_format() -> None:
