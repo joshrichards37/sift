@@ -66,4 +66,4 @@ async def _poll_once(source: Source, settings: Settings, prefs: Preferences, llm
         if score.score >= prefs.relevance_threshold:
             summary = await llm.summarize(art, prefs)
         with connect(settings.db_path) as conn:
-            mark_scored(conn, aid, score.score, summary)
+            mark_scored(conn, aid, score.score, summary, topic_tags=score.topic_tags)

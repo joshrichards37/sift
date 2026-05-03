@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import hashlib
+import json
 import sqlite3
 from collections.abc import Iterator
 from contextlib import contextmanager
@@ -19,6 +20,7 @@ CREATE TABLE IF NOT EXISTS articles (
     ingested_at     TEXT NOT NULL,
     relevance_score INTEGER,
     summary         TEXT,
+    topic_tags      TEXT,
     pushed_at       TEXT
 );
 
@@ -39,6 +41,21 @@ CREATE TABLE IF NOT EXISTS source_cursor (
     cursor       TEXT NOT NULL,
     updated_at   TEXT NOT NULL
 );
+
+CREATE TABLE IF NOT EXISTS suggestion_candidates (
+    id                   INTEGER PRIMARY KEY AUTOINCREMENT,
+    chat_id              TEXT NOT NULL,
+    topic                TEXT NOT NULL,
+    confidence           REAL NOT NULL,
+    evidence_article_ids TEXT NOT NULL,
+    created_at           TEXT NOT NULL,
+    surfaced_at          TEXT,
+    responded_at         TEXT,
+    response             TEXT CHECK (response IS NULL OR response IN ('added', 'declined', 'muted'))
+);
+
+CREATE INDEX IF NOT EXISTS idx_suggestion_candidates_chat
+    ON suggestion_candidates(chat_id, response, created_at DESC);
 """
 
 
@@ -54,6 +71,11 @@ def init_db(path: Path) -> None:
     path.parent.mkdir(parents=True, exist_ok=True)
     with sqlite3.connect(path) as conn:
         conn.executescript(SCHEMA)
+        # Additive migration: pre-existing DBs miss articles.topic_tags
+        # because CREATE TABLE IF NOT EXISTS won't add columns to an extant table.
+        cols = {row[1] for row in conn.execute("PRAGMA table_info(articles)")}
+        if "topic_tags" not in cols:
+            conn.execute("ALTER TABLE articles ADD COLUMN topic_tags TEXT")
 
 
 @contextmanager
@@ -98,10 +120,17 @@ def insert_article(
     return aid
 
 
-def mark_scored(conn: sqlite3.Connection, article_id: str, score: int, summary: str | None) -> None:
+def mark_scored(
+    conn: sqlite3.Connection,
+    article_id: str,
+    score: int,
+    summary: str | None,
+    topic_tags: list[str] | None = None,
+) -> None:
+    tags_blob = json.dumps(topic_tags) if topic_tags else None
     conn.execute(
-        "UPDATE articles SET relevance_score = ?, summary = ? WHERE id = ?",
-        (score, summary, article_id),
+        "UPDATE articles SET relevance_score = ?, summary = ?, topic_tags = ? WHERE id = ?",
+        (score, summary, tags_blob, article_id),
     )
 
 
@@ -192,3 +221,81 @@ def recent_articles(conn: sqlite3.Connection, limit: int = 20) -> list[sqlite3.R
             (limit,),
         )
     )
+
+
+def article_topic_tags(raw: str | None) -> list[str]:
+    """Decode the JSON-encoded topic_tags column. Robust to None and bad JSON."""
+    if not raw:
+        return []
+    try:
+        parsed = json.loads(raw)
+    except json.JSONDecodeError:
+        return []
+    return [str(t) for t in parsed] if isinstance(parsed, list) else []
+
+
+def record_suggestion_candidate(
+    conn: sqlite3.Connection,
+    *,
+    chat_id: str,
+    topic: str,
+    confidence: float,
+    evidence_article_ids: list[str],
+) -> int:
+    cur = conn.execute(
+        """
+        INSERT INTO suggestion_candidates
+            (chat_id, topic, confidence, evidence_article_ids, created_at)
+        VALUES (?, ?, ?, ?, ?)
+        """,
+        (chat_id, topic, confidence, json.dumps(evidence_article_ids), now_iso()),
+    )
+    return int(cur.lastrowid or 0)
+
+
+def pending_suggestion_for(conn: sqlite3.Connection, chat_id: str) -> sqlite3.Row | None:
+    """Highest-confidence un-responded suggestion for this chat, if any."""
+    return conn.execute(
+        """
+        SELECT id, chat_id, topic, confidence, evidence_article_ids,
+               created_at, surfaced_at, responded_at, response
+        FROM suggestion_candidates
+        WHERE chat_id = ? AND response IS NULL
+        ORDER BY confidence DESC, created_at DESC
+        LIMIT 1
+        """,
+        (chat_id,),
+    ).fetchone()
+
+
+def mark_suggestion_surfaced(conn: sqlite3.Connection, suggestion_id: int) -> None:
+    conn.execute(
+        "UPDATE suggestion_candidates SET surfaced_at = ? WHERE id = ?",
+        (now_iso(), suggestion_id),
+    )
+
+
+def respond_to_suggestion(conn: sqlite3.Connection, suggestion_id: int, response: str) -> None:
+    if response not in {"added", "declined", "muted"}:
+        raise ValueError(f"invalid suggestion response: {response!r}")
+    conn.execute(
+        "UPDATE suggestion_candidates SET response = ?, responded_at = ? WHERE id = ?",
+        (response, now_iso(), suggestion_id),
+    )
+
+
+def last_response_for_topic(
+    conn: sqlite3.Connection, *, chat_id: str, topic: str
+) -> sqlite3.Row | None:
+    """Most recent responded suggestion for this (chat, topic). Used by the recommender
+    to honour 'mute' permanently and apply a cooldown after 'declined'."""
+    return conn.execute(
+        """
+        SELECT response, responded_at
+        FROM suggestion_candidates
+        WHERE chat_id = ? AND topic = ? AND response IS NOT NULL
+        ORDER BY responded_at DESC
+        LIMIT 1
+        """,
+        (chat_id, topic),
+    ).fetchone()
