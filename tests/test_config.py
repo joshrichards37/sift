@@ -4,7 +4,7 @@ from pathlib import Path
 
 import pytest
 
-from sift.config import Preferences, Settings, load_preferences
+from sift.config import Preferences, Settings, SourcePref, load_preferences
 
 REPO_ROOT = Path(__file__).resolve().parent.parent
 EXAMPLES = REPO_ROOT / "examples"
@@ -94,6 +94,52 @@ def test_each_shipped_preset_parses(preset: Path) -> None:
     # All source IDs unique within a preset (storage uses them as foreign keys)
     ids = [s.id for s in prefs.sources]
     assert len(ids) == len(set(ids)), f"duplicate source ids in {preset.name}: {ids}"
+
+
+def test_source_pref_accepts_known_kinds() -> None:
+    """All four supported kinds — and the kind:slug variants — should parse."""
+    for valid_id in [
+        "hn",
+        "hn:finance",
+        "rss:simon-willison",
+        "reddit:rust",
+        "bsky:simonw",
+    ]:
+        SourcePref(id=valid_id)  # would raise on invalid
+
+
+def test_source_pref_rejects_unknown_kind() -> None:
+    """The exact bug that motivated this validator: 'hn-finance' (hyphen instead
+    of colon) must fail at parse time with a message that names the bad kind
+    AND the valid set, so the fix is obvious."""
+    with pytest.raises(ValueError) as exc_info:
+        SourcePref(id="hn-finance")
+    msg = str(exc_info.value)
+    assert "hn-finance" in msg
+    assert "hn:finance" in msg or "hn:<slug>" in msg or "kind:slug" in msg.lower() or "hn" in msg
+    # Valid kinds enumerated so the user knows what's allowed
+    for kind in ("hn", "rss", "reddit", "bsky"):
+        assert kind in msg
+
+
+def test_load_preferences_surfaces_bad_source_id_at_parse_time(tmp_path: Path) -> None:
+    """End-to-end: a preferences.yaml with a typo'd source id fails at
+    load_preferences(), not at startup in build_sources. This is the UX win
+    — the user sees the problem when they save the file, not minutes later."""
+    yaml_path = tmp_path / "p.yaml"
+    yaml_path.write_text(
+        """
+topics: |
+  whatever
+sources:
+  - id: hn-finance
+    enabled: true
+    query: "anything"
+""".strip()
+    )
+    with pytest.raises(ValueError) as exc_info:
+        load_preferences(yaml_path)
+    assert "hn-finance" in str(exc_info.value)
 
 
 def test_preferences_round_trip(tmp_path: Path) -> None:

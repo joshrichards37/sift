@@ -78,22 +78,34 @@ def test_cadence_blocks_when_recent_suggestion_exists(tmp_path: Path) -> None:
 
 
 def test_cadence_releases_after_cooldown_window(tmp_path: Path) -> None:
-    """Once the cooldown elapses, the chat is eligible again. Tested by stepping
-    `now` forward rather than backdating the row — clearer intent."""
+    """Once the cooldown elapses, the chat is eligible again. Backdate the
+    seeded row's created_at so the test isn't entangled with wall-clock now —
+    record_suggestion_candidate uses real time, and on dates close to `base`
+    that races the simulated 'past 7 days' assertion."""
     db = _db(tmp_path)
     base = datetime(2026, 5, 1, tzinfo=UTC)
     with connect(db) as conn:
-        record_suggestion_candidate(
+        sid = record_suggestion_candidate(
             conn, chat_id="1", topic="x", confidence=0.8, evidence_article_ids=["a"]
         )
+        conn.execute(
+            "UPDATE suggestion_candidates SET created_at=? WHERE id=?",
+            (base.isoformat(), sid),
+        )
         # Within 7 days: still blocked.
-        assert cadence_blocks_chat(
-            conn, chat_id="1", now=base + timedelta(days=5), cooldown_days=7
-        ) is True
+        assert (
+            cadence_blocks_chat(
+                conn, chat_id="1", now=base + timedelta(days=5), cooldown_days=7
+            )
+            is True
+        )
         # Past 7 days: released.
-        assert cadence_blocks_chat(
-            conn, chat_id="1", now=base + timedelta(days=10), cooldown_days=7
-        ) is False
+        assert (
+            cadence_blocks_chat(
+                conn, chat_id="1", now=base + timedelta(days=10), cooldown_days=7
+            )
+            is False
+        )
 
 
 async def test_suggest_for_chat_returns_first_qualifying_topic(tmp_path: Path) -> None:

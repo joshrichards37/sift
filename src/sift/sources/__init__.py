@@ -1,6 +1,11 @@
 from sift.sources.base import Article, Source
 
-__all__ = ["Article", "Source", "build_sources"]
+# Single source of truth for valid source-id prefixes. Imported by
+# sift.config.SourcePref to validate ids at parse time so a typo like
+# 'hn-finance' fails at load_preferences() instead of startup.
+KNOWN_KINDS: frozenset[str] = frozenset({"hn", "rss", "reddit", "bsky"})
+
+__all__ = ["Article", "KNOWN_KINDS", "Source", "build_sources"]
 
 
 def build_sources(prefs):
