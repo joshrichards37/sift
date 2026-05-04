@@ -3,8 +3,10 @@ from __future__ import annotations
 from pathlib import Path
 
 import yaml
-from pydantic import AliasChoices, BaseModel, Field
+from pydantic import AliasChoices, BaseModel, Field, field_validator
 from pydantic_settings import BaseSettings, SettingsConfigDict
+
+from sift.sources import KNOWN_KINDS
 
 
 class Settings(BaseSettings):
@@ -62,6 +64,22 @@ class SourcePref(BaseModel):
     min_points: int | None = None
     handle: str | None = None
     subreddit: str | None = None
+
+    @field_validator("id")
+    @classmethod
+    def _check_kind(cls, v: str) -> str:
+        """Source ids follow 'kind' or 'kind:slug'. Catch typos like
+        'hn-finance' (hyphen instead of colon) at parse time rather than
+        at startup, where the error becomes a confusing factory traceback."""
+        kind = v.split(":", 1)[0]
+        if kind not in KNOWN_KINDS:
+            valid = ", ".join(sorted(KNOWN_KINDS))
+            raise ValueError(
+                f"unknown source kind {kind!r} in id {v!r}. "
+                f"Source ids must start with one of: {valid}, optionally followed "
+                f"by ':<slug>' (e.g. 'hn:finance', 'rss:my-blog', 'reddit:rust')."
+            )
+        return v
 
 
 class Preferences(BaseModel):

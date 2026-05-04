@@ -184,10 +184,12 @@ def test_factory_raises_for_reddit_without_subreddit() -> None:
         build_sources(prefs)
 
 
-def test_factory_raises_for_unknown_kind() -> None:
-    prefs = _prefs(SourcePref(id="mastodon:user", enabled=True))
+def test_unknown_kind_rejected_at_pref_construction() -> None:
+    """Validation moved up to SourcePref so the typo fails at preferences-load
+    time rather than at build_sources. The test still proves the same rule —
+    invalid kinds can't reach the factory."""
     with pytest.raises(ValueError, match="unknown source kind"):
-        build_sources(prefs)
+        SourcePref(id="mastodon:user", enabled=True)
 
 
 # ── Suppress unused-import warning for _patch when not used ─────────────────
