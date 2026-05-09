@@ -3,7 +3,7 @@ from sift.sources.base import Article, Source
 # Single source of truth for valid source-id prefixes. Imported by
 # sift.config.SourcePref to validate ids at parse time so a typo like
 # 'hn-finance' fails at load_preferences() instead of startup.
-KNOWN_KINDS: frozenset[str] = frozenset({"hn", "rss", "reddit", "bsky", "github", "arxiv"})
+KNOWN_KINDS: frozenset[str] = frozenset({"hn", "rss", "reddit", "bsky", "github", "arxiv", "masto"})
 
 __all__ = ["Article", "KNOWN_KINDS", "Source", "build_sources"]
 
@@ -13,6 +13,7 @@ def build_sources(prefs):
     from sift.sources.bluesky import BlueskySource
     from sift.sources.github import GitHubReleasesSource
     from sift.sources.hn import HackerNewsSource
+    from sift.sources.mastodon import MastodonSource
     from sift.sources.reddit import RedditSource
     from sift.sources.rss import RSSSource
 
@@ -65,6 +66,19 @@ def build_sources(prefs):
                     categories=s.categories or [],
                     query=s.query or "",
                     max_results=s.max_results or 20,
+                    cadence_seconds=s.cadence_seconds,
+                )
+            )
+        elif kind == "masto":
+            if not s.handle:
+                raise ValueError(
+                    f"masto source {s.id!r} requires 'handle' field "
+                    f"(e.g. 'simon@simonwillison.net')"
+                )
+            out.append(
+                MastodonSource(
+                    id=s.id,
+                    handle=s.handle,
                     cadence_seconds=s.cadence_seconds,
                 )
             )

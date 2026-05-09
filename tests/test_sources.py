@@ -11,6 +11,7 @@ from sift.sources import build_sources
 from sift.sources.arxiv import ArxivSource
 from sift.sources.github import GitHubReleasesSource
 from sift.sources.hn import HackerNewsSource
+from sift.sources.mastodon import MastodonSource, _strip_html
 from sift.sources.reddit import RedditSource
 
 # ── HackerNewsSource: query splitting ───────────────────────────────────────
@@ -490,6 +491,106 @@ async def test_arxiv_passes_search_query_to_api(monkeypatch) -> None:
     assert params.get("sortBy") == "submittedDate"
 
 
+# ── MastodonSource: handle parsing + status payload ───────────────────────
+
+
+def test_masto_invalid_handle_disables_source() -> None:
+    """A handle missing the @instance half is unrecoverable — disable so
+    the scheduler doesn't repeatedly fail to resolve."""
+    src = MastodonSource(id="masto:bad", handle="not-a-handle")
+    assert src.disabled is True
+    assert "invalid Mastodon handle" in src.disabled_reason
+
+
+def test_masto_strips_leading_at_in_handle() -> None:
+    """Users will paste handles with the leading @ — be forgiving."""
+    src = MastodonSource(id="masto:simon", handle="@simon@simonwillison.net")
+    assert src.disabled is False
+
+
+def test_masto_strip_html_unwraps_links() -> None:
+    """Link targets must survive the HTML strip — they're often the most
+    relevant signal in a short post."""
+    text = _strip_html(
+        '<p>Check out <a href="https://example.com/post">this writeup</a> on testing.</p>'
+    )
+    assert "this writeup (https://example.com/post)" in text
+    assert "<" not in text
+
+
+def test_masto_strip_html_decodes_entities() -> None:
+    text = _strip_html("<p>Tom &amp; Jerry &lt;3</p>")
+    assert text == "Tom & Jerry <3"
+
+
+_MASTO_LOOKUP = {"id": "12345"}
+_MASTO_STATUSES = [
+    {
+        "id": "100",
+        "url": "https://example.social/@user/100",
+        "content": "<p>First post about <a href=\"https://x.test\">a thing</a></p>",
+        "created_at": "2026-05-01T12:00:00Z",
+        "account": {"acct": "user@example.social", "username": "user"},
+    },
+    {
+        # Reblog — should unwrap to the boosted post
+        "id": "101",
+        "url": "https://example.social/@user/101",
+        "content": "",
+        "reblog": {
+            "id": "999",
+            "url": "https://other.social/@author/999",
+            "content": "<p>Boosted content here.</p>",
+            "created_at": "2026-04-30T08:00:00Z",
+            "account": {"acct": "author@other.social", "username": "author"},
+        },
+    },
+]
+
+
+class _FakeMastoResponse:
+    def __init__(self, payload, status: int = 200) -> None:
+        self._payload = payload
+        self.status_code = status
+
+    def raise_for_status(self) -> None:
+        if self.status_code >= 400:
+            raise httpx.HTTPStatusError("err", request=None, response=None)  # type: ignore[arg-type]
+
+    def json(self):
+        return self._payload
+
+
+class _FakeMastoClient:
+    """Routes /lookup vs /statuses by URL substring so one fake handles
+    both calls in the two-step resolve-then-fetch dance."""
+
+    def __init__(self, *args: Any, **kwargs: Any) -> None: ...
+    async def __aenter__(self) -> _FakeMastoClient:
+        return self
+
+    async def __aexit__(self, *_: Any) -> None: ...
+
+    async def get(self, url: str, params: dict | None = None) -> _FakeMastoResponse:
+        if "/lookup" in url:
+            return _FakeMastoResponse(_MASTO_LOOKUP)
+        if "/statuses" in url:
+            return _FakeMastoResponse(_MASTO_STATUSES)
+        return _FakeMastoResponse({}, status=404)
+
+
+async def test_masto_parses_statuses_and_unwraps_reblogs(monkeypatch) -> None:
+    monkeypatch.setattr(httpx, "AsyncClient", _FakeMastoClient)
+    src = MastodonSource(id="masto:test", handle="user@example.social")
+    arts = await src.poll()
+    assert len(arts) == 2
+    # Reblog gets unwrapped: url + author come from the original post.
+    reblog_art = arts[1]
+    assert reblog_art.url == "https://other.social/@author/999"
+    assert reblog_art.author == "author@other.social"
+    assert "Boosted content" in reblog_art.body
+
+
 # ── build_sources factory ───────────────────────────────────────────────────
 
 
@@ -504,9 +605,10 @@ def test_factory_dispatches_each_kind() -> None:
         SourcePref(id="reddit:programming", subreddit="programming", enabled=True),
         SourcePref(id="github:vllm", repo="vllm-project/vllm", enabled=True),
         SourcePref(id="arxiv:ml", categories=["cs.LG"], enabled=True),
+        SourcePref(id="masto:simon", handle="simon@simonwillison.net", enabled=True),
     )
     sources = build_sources(prefs)
-    assert len(sources) == 5
+    assert len(sources) == 6
     kinds = {type(s).__name__ for s in sources}
     assert kinds == {
         "RSSSource",
@@ -514,7 +616,14 @@ def test_factory_dispatches_each_kind() -> None:
         "RedditSource",
         "GitHubReleasesSource",
         "ArxivSource",
+        "MastodonSource",
     }
+
+
+def test_factory_raises_for_masto_without_handle() -> None:
+    prefs = _prefs(SourcePref(id="masto:bad", enabled=True))  # no handle set
+    with pytest.raises(ValueError, match="masto source.*requires 'handle'"):
+        build_sources(prefs)
 
 
 def test_factory_raises_for_github_without_repo() -> None:

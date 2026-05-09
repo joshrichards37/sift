@@ -91,6 +91,14 @@ sources:
     prereleases: false
     cadence_seconds: 3600
 
+  # Mastodon author feed. Public posts only — no auth needed. Handle is
+  # "user@instance.tld". Reblogs are unwrapped to the original post so the
+  # LLM scores the boosted content, not "X boosted Y".
+  - id: masto:example
+    enabled: false
+    handle: simon@fedi.simonwillison.net
+    cadence_seconds: 1800
+
   # arXiv search via the export API. Combines a list of category codes with
   # an optional keyword query — far more useful than the per-category RSS
   # feeds (which can't be filtered). Common cats: cs.AI, cs.LG, cs.CL,

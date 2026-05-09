@@ -773,6 +773,8 @@ Allowed source kinds and their fields:
   - id: github:<slug>         fields: repo (str, "owner/name"), prereleases (bool, default false)
   - id: arxiv:<slug>          fields: categories (list of arXiv codes like cs.AI, cs.LG), \
 query (str, optional keywords to AND with categories), max_results (int, default 20)
+  - id: masto:<slug>          fields: handle (str, "user@instance.tld", \
+e.g. "simon@simonwillison.net")
 
 Generate 3-6 source entries matching the user's interests.
 
@@ -801,6 +803,12 @@ Hard constraints — silently ignored sources are worse than no sources:
   linguistics / NLP), cs.CV (computer vision), cs.RO (robotics), stat.ML, q-bio.NC. \
   Combine 1-3 categories with an optional keyword query to filter the firehose. \
   Don't add an arxiv source for general news interests.
+
+- For masto: only include when the user explicitly mentions Mastodon, the fediverse, \
+  or names a Mastodon handle. Format is "user@instance.tld" — invent neither the \
+  handle nor the instance. The instance is often a separate domain from someone's \
+  blog (e.g. simon@fedi.simonwillison.net is real; simon@simonwillison.net is not). \
+  Prefer RSS or HN if you're unsure.
 
 - HN queries: use double quotes around exact phrases, never single quotes (single \
   quotes get URL-encoded literally). Make sure every quote is balanced. \
@@ -1068,6 +1076,26 @@ async def _check_one_source(client: httpx.AsyncClient, source: dict) -> str | No
                 return "rate-limited (set GITHUB_TOKEN to raise the limit)"
             if r.status_code >= 400:
                 return f"HTTP {r.status_code}"
+            return None
+        except Exception as e:
+            return f"check failed ({type(e).__name__})"
+
+    if kind == "masto":
+        handle = (source.get("handle") or "").strip().lstrip("@")
+        if "@" not in handle:
+            return "invalid handle (need 'user@instance.tld')"
+        username, _, instance = handle.partition("@")
+        if not username or not instance:
+            return "invalid handle (need 'user@instance.tld')"
+        try:
+            r = await client.get(
+                f"https://{instance}/api/v1/accounts/lookup",
+                params={"acct": username},
+            )
+            if r.status_code == 404:
+                return f"account @{username}@{instance} not found"
+            if r.status_code >= 400:
+                return f"HTTP {r.status_code} from instance"
             return None
         except Exception as e:
             return f"check failed ({type(e).__name__})"
