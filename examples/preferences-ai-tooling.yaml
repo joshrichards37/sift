@@ -137,3 +137,35 @@ sources:
     subreddit: LangChain
     min_points: 30
     cadence_seconds: 7200
+
+  # GitHub releases for the projects you actually run. One Article per
+  # release with full notes — far higher signal than HN keyword matching.
+  - id: github:vllm
+    enabled: true
+    repo: vllm-project/vllm
+    cadence_seconds: 3600
+
+  - id: github:llama-cpp
+    enabled: true
+    repo: ggml-org/llama.cpp
+    cadence_seconds: 3600
+
+  - id: github:ollama
+    enabled: true
+    repo: ollama/ollama
+    cadence_seconds: 3600
+
+  - id: github:transformers
+    enabled: true
+    repo: huggingface/transformers
+    cadence_seconds: 7200
+
+  - id: github:anthropic-sdk
+    enabled: true
+    repo: anthropics/anthropic-sdk-python
+    cadence_seconds: 7200
+
+  - id: github:claude-code
+    enabled: true
+    repo: anthropics/claude-code
+    cadence_seconds: 3600

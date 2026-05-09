@@ -8,9 +8,9 @@ import pytest
 
 from sift.config import Preferences, SourcePref
 from sift.sources import build_sources
+from sift.sources.github import GitHubReleasesSource
 from sift.sources.hn import HackerNewsSource
 from sift.sources.reddit import RedditSource
-
 
 # ── HackerNewsSource: query splitting ───────────────────────────────────────
 
@@ -77,7 +77,7 @@ class _FakeAsyncClient:
     payload: dict[str, Any] = {}
 
     def __init__(self, *args: Any, **kwargs: Any) -> None: ...
-    async def __aenter__(self) -> "_FakeAsyncClient": return self
+    async def __aenter__(self) -> _FakeAsyncClient: return self
     async def __aexit__(self, *_: Any) -> None: ...
     async def get(self, _url: str, params: dict | None = None) -> _FakeResponse:
         return _FakeResponse(self.payload)
@@ -149,6 +149,133 @@ async def test_reddit_handles_empty_payload(fake_reddit) -> None:
     assert arts == []
 
 
+# ── GitHubReleasesSource: payload parsing + filtering ─────────────────────
+
+
+def _gh_release(
+    *,
+    tag: str,
+    name: str | None = None,
+    body: str = "",
+    draft: bool = False,
+    prerelease: bool = False,
+    author: str = "octocat",
+    published: str = "2026-05-01T12:00:00Z",
+) -> dict[str, Any]:
+    return {
+        "tag_name": tag,
+        "name": name,
+        "body": body,
+        "draft": draft,
+        "prerelease": prerelease,
+        "author": {"login": author},
+        "published_at": published,
+        "html_url": f"https://github.com/example/repo/releases/tag/{tag}",
+    }
+
+
+class _FakeReleasesResponse:
+    def __init__(self, payload: list[dict]) -> None:
+        self._payload = payload
+
+    def raise_for_status(self) -> None: ...
+    def json(self) -> list[dict]:
+        return self._payload
+
+
+class _FakeReleasesClient:
+    """Minimal AsyncClient stand-in that captures the request headers and
+    returns canned releases. Used to assert auth-header behavior."""
+
+    payload: list[dict] = []
+    captured_headers: dict[str, str] | None = None
+
+    def __init__(self, *args: Any, **kwargs: Any) -> None:
+        _FakeReleasesClient.captured_headers = dict(kwargs.get("headers") or {})
+
+    async def __aenter__(self) -> _FakeReleasesClient:
+        return self
+
+    async def __aexit__(self, *_: Any) -> None: ...
+
+    async def get(self, _url: str, params: dict | None = None) -> _FakeReleasesResponse:
+        return _FakeReleasesResponse(self.payload)
+
+
+@pytest.fixture
+def fake_github(monkeypatch: pytest.MonkeyPatch):
+    def _set(payload: list[dict]) -> None:
+        _FakeReleasesClient.payload = payload
+        _FakeReleasesClient.captured_headers = None
+        monkeypatch.setattr(httpx, "AsyncClient", _FakeReleasesClient)
+
+    return _set
+
+
+async def test_github_skips_drafts(fake_github) -> None:
+    fake_github(
+        [
+            _gh_release(tag="v1.0.0", name="First stable"),
+            _gh_release(tag="v1.1.0-draft", draft=True),
+        ]
+    )
+    src = GitHubReleasesSource(id="github:test", repo="example/repo")
+    arts = await src.poll()
+    assert len(arts) == 1
+    assert arts[0].title.endswith("First stable")
+
+
+async def test_github_skips_prereleases_by_default(fake_github) -> None:
+    fake_github(
+        [
+            _gh_release(tag="v1.0.0"),
+            _gh_release(tag="v1.1.0-rc1", prerelease=True),
+        ]
+    )
+    src = GitHubReleasesSource(id="github:test", repo="example/repo")
+    arts = await src.poll()
+    assert {a.title.split()[-1] for a in arts} == {"v1.0.0"}
+
+
+async def test_github_includes_prereleases_when_opted_in(fake_github) -> None:
+    fake_github(
+        [
+            _gh_release(tag="v1.0.0"),
+            _gh_release(tag="v1.1.0-rc1", prerelease=True),
+        ]
+    )
+    src = GitHubReleasesSource(id="github:test", repo="example/repo", prereleases=True)
+    arts = await src.poll()
+    assert len(arts) == 2
+
+
+async def test_github_falls_back_to_tag_when_name_missing(fake_github) -> None:
+    """Many repos leave `name` empty and only set `tag_name`. Title should
+    still carry the version so the digest line is informative."""
+    fake_github([_gh_release(tag="v2.5.0", name=None)])
+    src = GitHubReleasesSource(id="github:vllm", repo="vllm-project/vllm")
+    arts = await src.poll()
+    assert arts[0].title == "vllm-project/vllm v2.5.0"
+
+
+async def test_github_uses_token_when_set(fake_github, monkeypatch) -> None:
+    monkeypatch.setenv("GITHUB_TOKEN", "ghp_secret")
+    fake_github([_gh_release(tag="v1.0.0")])
+    src = GitHubReleasesSource(id="github:test", repo="example/repo")
+    await src.poll()
+    headers = _FakeReleasesClient.captured_headers or {}
+    assert headers.get("Authorization") == "Bearer ghp_secret"
+
+
+async def test_github_anonymous_when_no_token(fake_github, monkeypatch) -> None:
+    monkeypatch.delenv("GITHUB_TOKEN", raising=False)
+    fake_github([_gh_release(tag="v1.0.0")])
+    src = GitHubReleasesSource(id="github:test", repo="example/repo")
+    await src.poll()
+    headers = _FakeReleasesClient.captured_headers or {}
+    assert "Authorization" not in headers
+
+
 # ── build_sources factory ───────────────────────────────────────────────────
 
 
@@ -161,11 +288,18 @@ def test_factory_dispatches_each_kind() -> None:
         SourcePref(id="rss:blog", url="https://example.com/feed", enabled=True),
         SourcePref(id="hn", query="x", enabled=True),
         SourcePref(id="reddit:programming", subreddit="programming", enabled=True),
+        SourcePref(id="github:vllm", repo="vllm-project/vllm", enabled=True),
     )
     sources = build_sources(prefs)
-    assert len(sources) == 3
+    assert len(sources) == 4
     kinds = {type(s).__name__ for s in sources}
-    assert kinds == {"RSSSource", "HackerNewsSource", "RedditSource"}
+    assert kinds == {"RSSSource", "HackerNewsSource", "RedditSource", "GitHubReleasesSource"}
+
+
+def test_factory_raises_for_github_without_repo() -> None:
+    prefs = _prefs(SourcePref(id="github:bad", enabled=True))  # no repo set
+    with pytest.raises(ValueError, match="github source.*requires 'repo'"):
+        build_sources(prefs)
 
 
 def test_factory_skips_disabled_sources() -> None:

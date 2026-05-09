@@ -80,3 +80,13 @@ sources:
     enabled: false
     handle: example.bsky.social
     cadence_seconds: 900
+
+  # GitHub releases for one repository. Highest signal-to-noise for "did X ship
+  # a new version" — far better than HN keyword search. Set GITHUB_TOKEN in .env
+  # to raise the rate limit from 60/h to 5000/h (anonymous is fine for a few
+  # repos at hourly cadence). Set prereleases: true to include alpha/beta/rc.
+  - id: github:example-repo
+    enabled: false
+    repo: vllm-project/vllm
+    prereleases: false
+    cadence_seconds: 3600

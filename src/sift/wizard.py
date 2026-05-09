@@ -766,10 +766,11 @@ sources:
     <kind-specific fields>
 
 Allowed source kinds and their fields:
-  - id: hn                    fields: query (str, multiple terms joined " OR "), min_points (int)
+  - id: hn                    fields: query (str, terms joined " OR "), min_points (int)
   - id: rss:<slug>            fields: url (str, full feed URL)
   - id: reddit:<slug>         fields: subreddit (str, single name or "a+b+c"), min_points (int)
   - id: bsky:<handle>         fields: handle (str, e.g. someone.bsky.social)
+  - id: github:<slug>         fields: repo (str, "owner/name"), prereleases (bool, default false)
 
 Generate 3-6 source entries matching the user's interests.
 
@@ -785,6 +786,13 @@ Hard constraints — silently ignored sources are worse than no sources:
   artificial, OpenAI, askscience, ChatGPT, learnmachinelearning. If you're tempted \
   to invent a subreddit name (e.g. r/AI, r/Tech, r/Coding), DO NOT — those don't \
   exist. Use a broader well-known sub or fall back to HN/RSS instead.
+
+- For github: "owner/name" must be a real repo. Common high-signal targets for \
+  AI/ML tooling: vllm-project/vllm, huggingface/transformers, ggml-org/llama.cpp, \
+  ollama/ollama, openai/openai-python, anthropics/anthropic-sdk-python, \
+  langchain-ai/langchain, pytorch/pytorch. Releases are far higher signal-to-noise \
+  than HN for "did X ship a new version" — prefer github sources over HN keyword \
+  searches when the user names specific projects.
 
 - HN queries: use double quotes around exact phrases, never single quotes (single \
   quotes get URL-encoded literally). Make sure every quote is balanced. \
@@ -1005,6 +1013,25 @@ async def _check_one_source(client: httpx.AsyncClient, source: dict) -> str | No
                 return "subreddit not found"
             if r.status_code == 403:
                 return "subreddit is private or quarantined"
+            if r.status_code >= 400:
+                return f"HTTP {r.status_code}"
+            return None
+        except Exception as e:
+            return f"check failed ({type(e).__name__})"
+
+    if kind == "github":
+        repo = source.get("repo") or ""
+        if not repo or "/" not in repo:
+            return "missing or invalid repo (need 'owner/name')"
+        try:
+            r = await client.get(
+                f"https://api.github.com/repos/{repo}",
+                headers={"Accept": "application/vnd.github+json"},
+            )
+            if r.status_code == 404:
+                return "repository not found"
+            if r.status_code == 403:
+                return "rate-limited (set GITHUB_TOKEN to raise the limit)"
             if r.status_code >= 400:
                 return f"HTTP {r.status_code}"
             return None

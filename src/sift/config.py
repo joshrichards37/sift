@@ -64,6 +64,8 @@ class SourcePref(BaseModel):
     min_points: int | None = None
     handle: str | None = None
     subreddit: str | None = None
+    repo: str | None = None  # github sources: "owner/name"
+    prereleases: bool = False  # github sources: include pre-releases (default: stable only)
 
     @field_validator("id")
     @classmethod
