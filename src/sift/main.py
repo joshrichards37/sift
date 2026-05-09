@@ -33,6 +33,7 @@ async def _main() -> None:
     # The PTB Application has its own startup/shutdown lifecycle. Run it manually
     # so the scheduler shares this process's event loop.
     await bot.app.initialize()
+    await bot.register_commands()
     await bot.app.start()
     await bot.app.updater.start_polling()
     try:

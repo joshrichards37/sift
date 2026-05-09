@@ -4,7 +4,7 @@ import logging
 from collections import defaultdict, deque
 from html import escape
 
-from telegram import InlineKeyboardButton, InlineKeyboardMarkup, Update
+from telegram import BotCommand, InlineKeyboardButton, InlineKeyboardMarkup, Update
 from telegram.constants import ParseMode
 from telegram.ext import (
     Application,
@@ -87,6 +87,23 @@ class Bot:
         )
         self.app.add_handler(
             CallbackQueryHandler(self._on_suggestion, pattern=rf"^{SUGGESTION_PREFIX}:")
+        )
+
+    async def register_commands(self) -> None:
+        """Register the slash-command list with Telegram so clients show the
+        inline `/` autocomplete popup. Without this, users have to type a
+        command and hit send before the client surfaces the help list."""
+        await self.app.bot.set_my_commands(
+            [
+                BotCommand("digest", "Send today's digest now"),
+                BotCommand("more", "Next batch from backlog"),
+                BotCommand("backlog", "Show unsent count"),
+                BotCommand("recent", "Show last 10 sent"),
+                BotCommand("prefs", "Show current settings"),
+                BotCommand("pause", "Stop outbound messages"),
+                BotCommand("resume", "Resume outbound messages"),
+                BotCommand("start", "Help and welcome"),
+            ]
         )
 
     async def send_message_safe(
