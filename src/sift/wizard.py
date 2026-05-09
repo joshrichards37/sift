@@ -771,8 +771,27 @@ Allowed source kinds and their fields:
   - id: reddit:<slug>         fields: subreddit (str, single name or "a+b+c"), min_points (int)
   - id: bsky:<handle>         fields: handle (str, e.g. someone.bsky.social)
 
-Generate 3-6 source entries matching the user's interests. Pick real, well-known feeds where \
-you can; use plausible URLs/handles where you can't. Do not invent new source kinds.
+Generate 3-6 source entries matching the user's interests.
+
+Hard constraints — silently ignored sources are worse than no sources:
+
+- DO NOT include any bsky: entry unless the user explicitly mentions Bluesky, the AT \
+  Protocol, or names a Bluesky handle. Bluesky sources require BLUESKY_HANDLE and \
+  BLUESKY_APP_PASSWORD env vars that most users don't have set, so an unsolicited \
+  bsky entry will raise on every poll.
+
+- For reddit: only use subreddits you are highly confident exist. Common safe ones: \
+  programming, MachineLearning, LocalLLaMA, rust, golang, python, datascience, \
+  artificial, OpenAI, askscience, ChatGPT, learnmachinelearning. If you're tempted \
+  to invent a subreddit name (e.g. r/AI, r/Tech, r/Coding), DO NOT — those don't \
+  exist. Use a broader well-known sub or fall back to HN/RSS instead.
+
+- HN queries: use double quotes around exact phrases, never single quotes (single \
+  quotes get URL-encoded literally). Make sure every quote is balanced. \
+  Example query string: \"large language model\" OR llm OR \"local AI\"
+
+- RSS URLs must be plausible. If you don't know a real feed URL for a source, prefer \
+  an HN keyword search over a guessed RSS URL.
 
 Output the YAML and nothing else."""
 
@@ -805,6 +824,8 @@ def _draft_prefs_loop(state: WizardState) -> str | None:
         valid = _yaml_is_valid(yaml_text)
         if not valid:
             print("  ⚠ This doesn't validate against the Preferences schema.\n")
+        else:
+            yaml_text = _maybe_disable_dead_sources(yaml_text)
 
         accept_disabled = "invalid YAML — edit first" if not valid else None
         action = questionary.select(
@@ -890,6 +911,131 @@ def _yaml_is_valid(yaml_text: str) -> bool:
         return True
     except Exception:
         return False
+
+
+def _maybe_disable_dead_sources(yaml_text: str) -> str:
+    """Pre-flight every source in the drafted YAML and offer to auto-disable
+    any that fail. Returns the YAML (possibly modified). Reasoning: drafted
+    sources can be syntactically valid but operationally dead — hallucinated
+    subreddits, bsky entries without creds, broken RSS URLs. Catching these
+    before save spares the user a startup full of repeating tracebacks."""
+    try:
+        data = yaml.safe_load(yaml_text)
+    except yaml.YAMLError:
+        return yaml_text  # validity already checked upstream; trust the caller
+    sources = data.get("sources") or []
+    if not sources:
+        return yaml_text
+
+    print("  Pre-flight: checking each source…")
+    failures: list[tuple[str, str]] = asyncio.run(_check_sources(sources))
+    if not failures:
+        print(f"  ✓ all {len(sources)} sources reachable\n")
+        return yaml_text
+
+    print(f"  ⚠ {len(failures)} of {len(sources)} sources look dead:")
+    for src_id, reason in failures:
+        print(f"    · {src_id}  — {reason}")
+    print()
+
+    answer = questionary.confirm("Auto-disable these (set enabled: false)?", default=True).ask()
+    if answer is None:
+        raise KeyboardInterrupt
+    if not answer:
+        print("  (keeping them enabled — sift will log errors until you fix them)\n")
+        return yaml_text
+
+    bad_ids = {src_id for src_id, _ in failures}
+    for source in sources:
+        if source.get("id") in bad_ids:
+            source["enabled"] = False
+    return yaml.safe_dump(data, sort_keys=False, default_flow_style=False, width=120)
+
+
+async def _check_sources(sources: list[dict]) -> list[tuple[str, str]]:
+    """Run the per-kind reachability checks concurrently. Returns
+    (id, reason) for every source that failed."""
+    async with httpx.AsyncClient(timeout=5.0, follow_redirects=True) as client:
+        results = await asyncio.gather(
+            *(_check_one_source(client, src) for src in sources),
+            return_exceptions=True,
+        )
+    out: list[tuple[str, str]] = []
+    for src, res in zip(sources, results, strict=True):
+        if isinstance(res, str):  # error message
+            out.append((src.get("id", "<unknown>"), res))
+        elif isinstance(res, BaseException):
+            out.append((src.get("id", "<unknown>"), f"check raised: {res}"))
+    return out
+
+
+async def _check_one_source(client: httpx.AsyncClient, source: dict) -> str | None:
+    """None on success, or a one-line failure message. We don't want this
+    check to block forever on a slow feed, so each call has a short timeout
+    via the shared client."""
+    src_id = source.get("id", "")
+    kind = src_id.split(":", 1)[0]
+
+    if kind == "hn":
+        return None  # Algolia is always reachable; query validity is content not connectivity
+
+    if kind == "rss":
+        url = source.get("url") or ""
+        if not url:
+            return "missing url"
+        try:
+            r = await client.get(url)
+            if r.status_code >= 400:
+                return f"HTTP {r.status_code}"
+            if not r.content:
+                return "empty response"
+            return None
+        except Exception as e:
+            return f"unreachable ({type(e).__name__})"
+
+    if kind == "reddit":
+        sub = source.get("subreddit") or ""
+        if not sub:
+            return "missing subreddit"
+        # /about.json returns 404 when a sub doesn't exist, 403 if private/quarantined.
+        check_url = f"https://www.reddit.com/r/{sub.split('+')[0]}/about.json"
+        try:
+            r = await client.get(check_url, headers={"User-Agent": "sift-setup/1.0"})
+            if r.status_code == 404:
+                return "subreddit not found"
+            if r.status_code == 403:
+                return "subreddit is private or quarantined"
+            if r.status_code >= 400:
+                return f"HTTP {r.status_code}"
+            return None
+        except Exception as e:
+            return f"check failed ({type(e).__name__})"
+
+    if kind == "bsky":
+        if not _bluesky_creds_present():
+            return "BLUESKY_HANDLE/BLUESKY_APP_PASSWORD not set in .env"
+        handle = source.get("handle") or ""
+        if not handle:
+            return "missing handle"
+        try:
+            r = await client.get(
+                "https://bsky.social/xrpc/com.atproto.identity.resolveHandle",
+                params={"handle": handle},
+            )
+            if r.status_code >= 400:
+                return f"handle resolve failed ({r.status_code})"
+            return None
+        except Exception as e:
+            return f"check failed ({type(e).__name__})"
+
+    return f"unknown source kind: {kind!r}"
+
+
+def _bluesky_creds_present() -> bool:
+    """Check the on-disk .env for BLUESKY_* — we can't rely on os.environ
+    because Pydantic Settings reads .env at startup, not into the env."""
+    env = parse_env(ENV_PATH)
+    return _is_real(env.get("BLUESKY_HANDLE", "")) and _is_real(env.get("BLUESKY_APP_PASSWORD", ""))
 
 
 def _looks_small(model_tag: str) -> bool:
