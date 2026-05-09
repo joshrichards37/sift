@@ -325,8 +325,10 @@ def setup_backend(key: str, sys_info: SysInfo) -> BackendConfig:
 def setup_ollama() -> BackendConfig:
     check_ollama()
     hw = read_hardware()
-    if hw:
+    if hw and _hardware_is_useful(hw):
         print_hardware(hw)
+    else:
+        hw = None  # don't let zero-filled output drive the fit warning
     model = pick_model(hw)
     pull_model(model)
     return BackendConfig(
@@ -385,6 +387,16 @@ def read_hardware() -> dict | None:
         return None
 
 
+def _hardware_is_useful(hw: dict) -> bool:
+    """llmfit occasionally returns a stub dict (all zeros / unknowns) when it
+    can't read the system. Print-and-warn off that data is worse than silent —
+    treat empty hardware data as 'no info available' downstream."""
+    cpu = hw.get("cpu_name") or ""
+    ram = float(hw.get("total_ram_gb", 0) or 0)
+    gpus = hw.get("gpus") or []
+    return bool(cpu and cpu != "?") or ram > 0 or bool(gpus)
+
+
 def print_hardware(hw: dict) -> None:
     print("  Hardware (via llmfit):")
     cpu = hw.get("cpu_name", "?")
@@ -426,7 +438,17 @@ def pick_model(hw: dict | None) -> ModelPreset:
     choices.append(questionary.Separator())
     choices.append(questionary.Choice("Type a custom Ollama tag…", value=CUSTOM_TAG))
 
-    default = next((c for c in choices if isinstance(c, questionary.Choice)), None)
+    # questionary.Separator inherits from Choice, so isinstance(c, Choice) is
+    # True for both — must filter Separators explicitly or default lookup
+    # picks a non-selectable one and questionary raises.
+    default = next(
+        (
+            c
+            for c in choices
+            if isinstance(c, questionary.Choice) and not isinstance(c, questionary.Separator)
+        ),
+        None,
+    )
     answer = questionary.select("Choose a model", choices=choices, default=default).ask()
     if answer is None:
         raise KeyboardInterrupt
