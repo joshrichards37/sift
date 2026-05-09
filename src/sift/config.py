@@ -66,6 +66,8 @@ class SourcePref(BaseModel):
     subreddit: str | None = None
     repo: str | None = None  # github sources: "owner/name"
     prereleases: bool = False  # github sources: include pre-releases (default: stable only)
+    categories: list[str] | None = None  # arxiv sources: e.g. ["cs.AI", "cs.LG"]
+    max_results: int | None = None  # arxiv sources: per-poll fetch cap (default 20)
 
     @field_validator("id")
     @classmethod

@@ -771,6 +771,8 @@ Allowed source kinds and their fields:
   - id: reddit:<slug>         fields: subreddit (str, single name or "a+b+c"), min_points (int)
   - id: bsky:<handle>         fields: handle (str, e.g. someone.bsky.social)
   - id: github:<slug>         fields: repo (str, "owner/name"), prereleases (bool, default false)
+  - id: arxiv:<slug>          fields: categories (list of arXiv codes like cs.AI, cs.LG), \
+query (str, optional keywords to AND with categories), max_results (int, default 20)
 
 Generate 3-6 source entries matching the user's interests.
 
@@ -793,6 +795,12 @@ Hard constraints — silently ignored sources are worse than no sources:
   langchain-ai/langchain, pytorch/pytorch. Releases are far higher signal-to-noise \
   than HN for "did X ship a new version" — prefer github sources over HN keyword \
   searches when the user names specific projects.
+
+- For arxiv: only use when the user wants research papers. Categories must be real \
+  arXiv codes — common ones: cs.AI, cs.LG (machine learning), cs.CL (computational \
+  linguistics / NLP), cs.CV (computer vision), cs.RO (robotics), stat.ML, q-bio.NC. \
+  Combine 1-3 categories with an optional keyword query to filter the firehose. \
+  Don't add an arxiv source for general news interests.
 
 - HN queries: use double quotes around exact phrases, never single quotes (single \
   quotes get URL-encoded literally). Make sure every quote is balanced. \
@@ -1015,6 +1023,32 @@ async def _check_one_source(client: httpx.AsyncClient, source: dict) -> str | No
                 return "subreddit is private or quarantined"
             if r.status_code >= 400:
                 return f"HTTP {r.status_code}"
+            return None
+        except Exception as e:
+            return f"check failed ({type(e).__name__})"
+
+    if kind == "arxiv":
+        cats = source.get("categories") or []
+        query = source.get("query") or ""
+        if not cats and not query:
+            return "no categories or query specified"
+        # Build the same search_query the source will and run a tiny request.
+        if cats:
+            cat_clause = " OR ".join(f"cat:{c}" for c in cats)
+            if len(cats) > 1:
+                cat_clause = f"({cat_clause})"
+            search = cat_clause if not query else f"{cat_clause} AND all:({query})"
+        else:
+            search = f"all:({query})"
+        try:
+            r = await client.get(
+                "https://export.arxiv.org/api/query",
+                params={"search_query": search, "max_results": 1},
+            )
+            if r.status_code >= 400:
+                return f"HTTP {r.status_code}"
+            if "<entry>" not in r.text:
+                return "no matching papers (check categories / query)"
             return None
         except Exception as e:
             return f"check failed ({type(e).__name__})"

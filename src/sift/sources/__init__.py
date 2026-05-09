@@ -3,12 +3,13 @@ from sift.sources.base import Article, Source
 # Single source of truth for valid source-id prefixes. Imported by
 # sift.config.SourcePref to validate ids at parse time so a typo like
 # 'hn-finance' fails at load_preferences() instead of startup.
-KNOWN_KINDS: frozenset[str] = frozenset({"hn", "rss", "reddit", "bsky", "github"})
+KNOWN_KINDS: frozenset[str] = frozenset({"hn", "rss", "reddit", "bsky", "github", "arxiv"})
 
 __all__ = ["Article", "KNOWN_KINDS", "Source", "build_sources"]
 
 
 def build_sources(prefs):
+    from sift.sources.arxiv import ArxivSource
     from sift.sources.bluesky import BlueskySource
     from sift.sources.github import GitHubReleasesSource
     from sift.sources.hn import HackerNewsSource
@@ -55,6 +56,16 @@ def build_sources(prefs):
                     repo=s.repo,
                     cadence_seconds=s.cadence_seconds,
                     prereleases=s.prereleases,
+                )
+            )
+        elif kind == "arxiv":
+            out.append(
+                ArxivSource(
+                    id=s.id,
+                    categories=s.categories or [],
+                    query=s.query or "",
+                    max_results=s.max_results or 20,
+                    cadence_seconds=s.cadence_seconds,
                 )
             )
         else:

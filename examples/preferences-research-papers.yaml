@@ -40,20 +40,29 @@ digest_size: 10
 more_size: 5
 
 sources:
-  # arXiv RSS — these are noisy. Threshold + topic prompt do the filtering.
-  - id: rss:arxiv-cs-cl
+  # arXiv via the export API — categories AND-ed with a keyword filter so
+  # the firehose narrows to papers that overlap with stated topics. The
+  # plain /rss/<cat> feeds can't be filtered, so this preset previously
+  # had to lean on relevance_threshold to drop most of cs.LG.
+  - id: arxiv:foundation-models
     enabled: true
-    url: http://export.arxiv.org/rss/cs.CL
+    categories: [cs.LG, cs.CL, cs.AI]
+    query: "language model OR transformer OR scaling OR pretraining OR post-training"
+    max_results: 30
     cadence_seconds: 21600
 
-  - id: rss:arxiv-cs-lg
+  - id: arxiv:inference-serving
     enabled: true
-    url: http://export.arxiv.org/rss/cs.LG
+    categories: [cs.LG, cs.DC]
+    query: "inference OR serving OR quantization OR speculative decoding OR KV cache"
+    max_results: 20
     cadence_seconds: 21600
 
-  - id: rss:arxiv-cs-ai
+  - id: arxiv:agents-tools
     enabled: true
-    url: http://export.arxiv.org/rss/cs.AI
+    categories: [cs.AI, cs.CL]
+    query: "agent OR tool use OR planning OR multi-agent"
+    max_results: 20
     cadence_seconds: 21600
 
   # Lab + practitioner blogs

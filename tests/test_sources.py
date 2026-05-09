@@ -8,6 +8,7 @@ import pytest
 
 from sift.config import Preferences, SourcePref
 from sift.sources import build_sources
+from sift.sources.arxiv import ArxivSource
 from sift.sources.github import GitHubReleasesSource
 from sift.sources.hn import HackerNewsSource
 from sift.sources.reddit import RedditSource
@@ -377,6 +378,118 @@ async def test_github_anonymous_when_no_token(fake_github, monkeypatch) -> None:
     assert "Authorization" not in headers
 
 
+# ── ArxivSource: query construction + Atom parsing ────────────────────────
+
+
+def test_arxiv_search_query_categories_only() -> None:
+    src = ArxivSource(id="arxiv:ml", categories=["cs.LG", "cs.AI"])
+    assert src._build_search_query() == "(cat:cs.LG OR cat:cs.AI)"
+
+
+def test_arxiv_search_query_single_category_no_parens() -> None:
+    src = ArxivSource(id="arxiv:cl", categories=["cs.CL"])
+    assert src._build_search_query() == "cat:cs.CL"
+
+
+def test_arxiv_search_query_categories_and_keyword() -> None:
+    """Categories OR'd, then AND'd with the keyword clause — matches arXiv
+    expression syntax."""
+    src = ArxivSource(
+        id="arxiv:agents",
+        categories=["cs.AI", "cs.CL"],
+        query="tool use OR planning",
+    )
+    assert src._build_search_query() == "(cat:cs.AI OR cat:cs.CL) AND all:(tool use OR planning)"
+
+
+def test_arxiv_disables_when_no_categories_or_query() -> None:
+    """Empty config is operationally meaningless — no point making the
+    scheduler poll it just to receive arXiv's whole firehose."""
+    src = ArxivSource(id="arxiv:empty", categories=[], query="")
+    assert src.disabled is True
+    assert "no categories or query" in src.disabled_reason
+
+
+_ARXIV_ATOM = """<?xml version="1.0" encoding="UTF-8"?>
+<feed xmlns="http://www.w3.org/2005/Atom">
+  <entry>
+    <id>http://arxiv.org/abs/2026.01234v1</id>
+    <published>2026-01-15T18:30:00Z</published>
+    <updated>2026-01-15T18:30:00Z</updated>
+    <title>Speculative decoding with shared drafts</title>
+    <summary>We present a new approach to speculative decoding that
+shares draft model weights across the cluster, reducing serving
+overhead by 40 percent.</summary>
+    <author><name>Alice Researcher</name></author>
+    <author><name>Bob Coauthor</name></author>
+    <author><name>Carol Senior</name></author>
+    <author><name>Dan Junior</name></author>
+    <link href="http://arxiv.org/abs/2026.01234v1" rel="alternate" type="text/html"/>
+  </entry>
+  <entry>
+    <id>http://arxiv.org/abs/2026.05678v2</id>
+    <published>2026-01-10T09:00:00Z</published>
+    <updated>2026-01-12T09:00:00Z</updated>
+    <title>Quantization-aware training revisited</title>
+    <summary>A short note on QAT.</summary>
+    <author><name>Eve Solo</name></author>
+    <link href="http://arxiv.org/abs/2026.05678v2" rel="alternate" type="text/html"/>
+  </entry>
+</feed>
+"""
+
+
+class _FakeArxivResponse:
+    status_code = 200
+    text = _ARXIV_ATOM
+
+    def raise_for_status(self) -> None: ...
+
+
+class _FakeArxivClient:
+    captured_params: dict | None = None
+
+    def __init__(self, *args: Any, **kwargs: Any) -> None: ...
+    async def __aenter__(self) -> _FakeArxivClient:
+        return self
+
+    async def __aexit__(self, *_: Any) -> None: ...
+
+    async def get(self, _url: str, params: dict | None = None) -> _FakeArxivResponse:
+        _FakeArxivClient.captured_params = params
+        return _FakeArxivResponse()
+
+
+async def test_arxiv_parses_atom_payload(monkeypatch) -> None:
+    monkeypatch.setattr(httpx, "AsyncClient", _FakeArxivClient)
+    src = ArxivSource(id="arxiv:test", categories=["cs.LG"])
+    arts = await src.poll()
+    assert len(arts) == 2
+    assert arts[0].title == "Speculative decoding with shared drafts"
+    assert arts[0].url == "http://arxiv.org/abs/2026.01234v1"
+    assert "speculative decoding" in arts[0].body.lower()
+    # Authors capped at first 3 to keep the preview tight.
+    assert arts[0].author == "Alice Researcher, Bob Coauthor, Carol Senior"
+
+
+async def test_arxiv_passes_search_query_to_api(monkeypatch) -> None:
+    """Regression guard: if the search_query parameter ever stops being sent,
+    arXiv returns the entire archive and the LLM scoring blows up."""
+    monkeypatch.setattr(httpx, "AsyncClient", _FakeArxivClient)
+    _FakeArxivClient.captured_params = None
+    src = ArxivSource(
+        id="arxiv:nlp",
+        categories=["cs.CL"],
+        query="tokenizer",
+        max_results=15,
+    )
+    await src.poll()
+    params = _FakeArxivClient.captured_params or {}
+    assert params.get("search_query") == "cat:cs.CL AND all:(tokenizer)"
+    assert params.get("max_results") == 15
+    assert params.get("sortBy") == "submittedDate"
+
+
 # ── build_sources factory ───────────────────────────────────────────────────
 
 
@@ -390,11 +503,18 @@ def test_factory_dispatches_each_kind() -> None:
         SourcePref(id="hn", query="x", enabled=True),
         SourcePref(id="reddit:programming", subreddit="programming", enabled=True),
         SourcePref(id="github:vllm", repo="vllm-project/vllm", enabled=True),
+        SourcePref(id="arxiv:ml", categories=["cs.LG"], enabled=True),
     )
     sources = build_sources(prefs)
-    assert len(sources) == 4
+    assert len(sources) == 5
     kinds = {type(s).__name__ for s in sources}
-    assert kinds == {"RSSSource", "HackerNewsSource", "RedditSource", "GitHubReleasesSource"}
+    assert kinds == {
+        "RSSSource",
+        "HackerNewsSource",
+        "RedditSource",
+        "GitHubReleasesSource",
+        "ArxivSource",
+    }
 
 
 def test_factory_raises_for_github_without_repo() -> None:
