@@ -1,9 +1,11 @@
 from __future__ import annotations
 
 import logging
+import uuid
 from collections import defaultdict, deque
 from html import escape
 
+import yaml
 from telegram import BotCommand, InlineKeyboardButton, InlineKeyboardMarkup, Update
 from telegram.constants import ParseMode
 from telegram.ext import (
@@ -16,6 +18,15 @@ from telegram.ext import (
 )
 
 from sift.config import Preferences, Settings
+from sift.conversational import (
+    Intent,
+    UndoSnapshot,
+    UndoStack,
+    apply_intent,
+    classify_intent,
+    persist_prefs,
+    serialize_prefs,
+)
 from sift.digest import (
     SuggestionFooter,
     get_backlog_count,
@@ -35,6 +46,7 @@ DigestItem = tuple[int, str]  # (item number in the digest, article id)
 FEEDBACK_PREFIX = "fb"  # callback_data forms: fb:<article_id>:<+1|-1> | fb:expand
 EXPAND_CALLBACK = f"{FEEDBACK_PREFIX}:expand"
 SUGGESTION_PREFIX = "sg"  # callback_data form: sg:<suggestion_id>:<add|decline|mute>
+CONFIG_PREFIX = "cf"  # callback_data form: cf:<edit_id>:<confirm|cancel>
 # Cap on stored digest→items state to prevent unbounded memory growth across
 # many days of digests. Tapping Rate on an older digest just returns "expired".
 DIGEST_MEMORY_CAP = 50
@@ -58,6 +70,11 @@ class Bot:
         # button can recover which articles to thumbs-button. Lives in memory
         # only — restart drops state and old Rate buttons answer "expired."
         self._digest_items: dict[int, list[DigestItem]] = {}
+        # Pending config edits awaiting user confirmation. Keyed by a short
+        # token embedded in the inline-keyboard callback_data; cleared on
+        # confirm or cancel. Lives in memory only — restart drops state.
+        self._pending_edits: dict[str, Intent] = {}
+        self._undo = UndoStack()
         self.app: Application = Application.builder().token(settings.telegram_bot_token).build()
         self._wire_handlers()
 
@@ -78,6 +95,7 @@ class Bot:
         self.app.add_handler(CommandHandler("more", self._more, filters=auth))
         self.app.add_handler(CommandHandler("backlog", self._backlog, filters=auth))
         self.app.add_handler(CommandHandler("recent", self._recent, filters=auth))
+        self.app.add_handler(CommandHandler("undo", self._undo_cmd, filters=auth))
         self.app.add_handler(MessageHandler(auth & filters.TEXT & ~filters.COMMAND, self._on_text))
         # Inline-keyboard callbacks from the per-article thumbs buttons attached
         # to digest messages. CallbackQuery has no `from_user` filter form, so we
@@ -87,6 +105,9 @@ class Bot:
         )
         self.app.add_handler(
             CallbackQueryHandler(self._on_suggestion, pattern=rf"^{SUGGESTION_PREFIX}:")
+        )
+        self.app.add_handler(
+            CallbackQueryHandler(self._on_config_edit, pattern=rf"^{CONFIG_PREFIX}:")
         )
 
     async def register_commands(self) -> None:
@@ -100,6 +121,7 @@ class Bot:
                 BotCommand("backlog", "Show unsent count"),
                 BotCommand("recent", "Show last 10 sent"),
                 BotCommand("prefs", "Show current settings"),
+                BotCommand("undo", "Revert the last config edit"),
                 BotCommand("pause", "Stop outbound messages"),
                 BotCommand("resume", "Resume outbound messages"),
                 BotCommand("start", "Help and welcome"),
@@ -415,6 +437,39 @@ class Bot:
         await query.answer()
 
     async def _on_text(self, update: Update, _: ContextTypes.DEFAULT_TYPE) -> None:
+        """Route free-text messages: if the LLM classifies them as a config
+        edit, send a confirmation keyboard; otherwise fall through to the
+        existing chat-over-recent-articles flow.
+
+        False-positive intent classifications fall back to chat — see the
+        classifier's system prompt. The user can re-phrase if a chat got
+        misread as an edit."""
+        text = update.message.text or ""
+        intent = await classify_intent(self.llm, text)
+
+        if intent.kind == "source_change":
+            await update.message.reply_text(
+                "Source add/remove via chat isn't supported yet — please edit "
+                "<code>preferences.yaml</code> directly and restart sift. "
+                "Threshold, digest size, topic bullets and exclude keywords "
+                "can be edited via chat.",
+                parse_mode=ParseMode.HTML,
+            )
+            return
+
+        if intent.kind in {
+            "add_topic",
+            "add_exclude_keyword",
+            "set_threshold",
+            "set_digest_size",
+        }:
+            await self._send_edit_confirmation(update, intent)
+            return
+
+        # kind == "chat" — fall through to existing Q&A handler.
+        await self._reply_chat(update)
+
+    async def _reply_chat(self, update: Update) -> None:
         chat_id = update.effective_chat.id
         history = self._chat_history[chat_id]
         with connect(self.settings.db_path) as conn:
@@ -427,6 +482,97 @@ class Bot:
         history.append({"role": "user", "content": update.message.text})
         history.append({"role": "assistant", "content": reply})
         await update.message.reply_text(reply)
+
+    async def _send_edit_confirmation(self, update: Update, intent: Intent) -> None:
+        """Stash the proposed intent under a short token and present a
+        Confirm/Cancel keyboard. The token is necessary because Telegram's
+        callback_data is capped at 64 bytes — too small for an arbitrary
+        topic string."""
+        edit_id = uuid.uuid4().hex[:8]
+        self._pending_edits[edit_id] = intent
+        # Bound the dict — same FIFO eviction logic as digest items.
+        if len(self._pending_edits) > 32:
+            oldest = next(iter(self._pending_edits))
+            self._pending_edits.pop(oldest, None)
+        await update.message.reply_text(
+            f"📝 Proposed change: <b>{escape(intent.summary)}</b>",
+            parse_mode=ParseMode.HTML,
+            reply_markup=_build_config_keyboard(edit_id),
+        )
+
+    async def _on_config_edit(self, update: Update, _: ContextTypes.DEFAULT_TYPE) -> None:
+        """Handle Confirm/Cancel on a pending config edit. On confirm, snapshot
+        the current YAML, mutate the in-memory Preferences object, persist
+        atomically. /undo restores from the snapshot ring."""
+        query = update.callback_query
+        if query is None:
+            return
+        user_id = query.from_user.id if query.from_user else None
+        if user_id not in self.settings.chat_ids:
+            log.info("rejecting config callback from non-allowlisted user %s", user_id)
+            await query.answer("Not authorised.", show_alert=False)
+            return
+        parsed = _parse_config_callback(query.data or "")
+        if parsed is None:
+            await query.answer("Bad button data.", show_alert=False)
+            return
+        edit_id, action = parsed
+        intent = self._pending_edits.pop(edit_id, None)
+        if intent is None:
+            await query.answer("This edit has expired.", show_alert=False)
+            return
+        if action == "cancel":
+            await query.edit_message_text(
+                f"Cancelled: <i>{escape(intent.summary)}</i>",
+                parse_mode=ParseMode.HTML,
+            )
+            await query.answer()
+            return
+
+        # Confirm path: snapshot current YAML for /undo, mutate, persist.
+        try:
+            snapshot_yaml = serialize_prefs(self.prefs)
+            apply_intent(self.prefs, intent)
+            persist_prefs(self.prefs, self.settings.preferences_path)
+        except Exception as e:
+            log.exception("config edit failed to apply")
+            await query.edit_message_text(
+                f"✗ Failed to apply: {escape(str(e))}",
+                parse_mode=ParseMode.HTML,
+            )
+            await query.answer("Edit failed", show_alert=True)
+            return
+
+        self._undo.push(UndoSnapshot(yaml_text=snapshot_yaml, summary=intent.summary))
+        await query.edit_message_text(
+            f"✓ Applied: <b>{escape(intent.summary)}</b>\n"
+            f"<i>Use /undo to revert. preferences.yaml on disk has been updated; "
+            f"comments may be lost since chat edits are written via yaml.dump.</i>",
+            parse_mode=ParseMode.HTML,
+        )
+        await query.answer("Applied")
+
+    async def _undo_cmd(self, update: Update, _: ContextTypes.DEFAULT_TYPE) -> None:
+        """Pop the last config snapshot, restore in-memory + on-disk."""
+        snapshot = self._undo.pop()
+        if snapshot is None:
+            await update.message.reply_text("Nothing to undo.")
+            return
+        try:
+            restored = Preferences.model_validate(yaml.safe_load(snapshot.yaml_text))
+            # Mutate every field on the live Preferences object so other holders
+            # of the reference (scheduler, digest) see the change.
+            for field, value in restored.model_dump().items():
+                setattr(self.prefs, field, value)
+            persist_prefs(self.prefs, self.settings.preferences_path)
+        except Exception as e:
+            log.exception("undo failed to restore snapshot")
+            await update.message.reply_text(f"✗ Undo failed: {e}")
+            return
+        await update.message.reply_text(
+            f"↩ Reverted: <i>{escape(snapshot.summary)}</i>",
+            parse_mode=ParseMode.HTML,
+        )
 
 
 def _chunk(text: str, limit: int) -> list[str]:
@@ -531,3 +677,29 @@ def _parse_suggestion_callback(data: str) -> tuple[int, str] | None:
     if parts[2] not in ("add", "decline", "mute"):
         return None
     return sid, parts[2]
+
+
+def _build_config_keyboard(edit_id: str) -> InlineKeyboardMarkup:
+    """Two-button row under a proposed config edit: Confirm / Cancel.
+    edit_id is a short token that maps back to the stashed Intent."""
+    return InlineKeyboardMarkup(
+        [
+            [
+                InlineKeyboardButton(
+                    "✓ Confirm", callback_data=f"{CONFIG_PREFIX}:{edit_id}:confirm"
+                ),
+                InlineKeyboardButton("✗ Cancel", callback_data=f"{CONFIG_PREFIX}:{edit_id}:cancel"),
+            ]
+        ]
+    )
+
+
+def _parse_config_callback(data: str) -> tuple[str, str] | None:
+    """Decode 'cf:<edit_id>:<confirm|cancel>' → (edit_id, action). None on malformed."""
+    parts = data.split(":")
+    if len(parts) != 3 or parts[0] != CONFIG_PREFIX:
+        return None
+    edit_id = parts[1]
+    if not edit_id or parts[2] not in ("confirm", "cancel"):
+        return None
+    return edit_id, parts[2]
