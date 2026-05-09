@@ -37,6 +37,14 @@ PREFS_PATH = REPO_ROOT / "preferences.yaml"
 # emit a confusing validation traceback.
 TODO_PREFIX = "__TODO_"
 SKIP = "__SKIP__"
+CUSTOM_TAG = "__CUSTOM__"  # picker sentinel for "let me type any Ollama tag"
+
+# Curated model manifest hosted in the repo. Fetched at wizard time so we can
+# add or retire models without users having to upgrade `sift`. Falls back to
+# bundled PRESETS on any network or parse error.
+RECOMMENDATIONS_URL = (
+    "https://raw.githubusercontent.com/joshrichards37/sift/main/data/ollama_recommendations.json"
+)
 
 STAGES = ("backend", "telegram", "prefs")
 
@@ -350,32 +358,128 @@ def print_hardware(hw: dict) -> None:
 
 
 def pick_model(hw: dict | None) -> ModelPreset:
-    candidates = _filter_to_hardware(PRESETS, hw)
-    if not candidates:
-        candidates = PRESETS
-    choices = [
-        questionary.Choice(
-            f"{m.description}\n         "
-            f"tag: {m.tag} · est. {m.tps_est} tok/s · "
-            f"~{m.vram_gb:.0f}GB VRAM, {m.ram_gb:.0f}GB RAM",
-            value=m,
-        )
-        for m in candidates
-    ]
-    answer = questionary.select("Choose a model", choices=choices, default=choices[0]).ask()
+    """Three-tier picker: (1) already-installed Ollama models, (2) curated
+    recommendations fetched from the sift repo (offline-fallback to bundled
+    PRESETS), (3) free-form custom tag. Hardware fit is a warning, not a
+    filter — the user may know their setup better than llmfit does."""
+    installed = _get_installed_ollama_models()
+    recs = _fetch_recommendations() or PRESETS
+    rec_by_tag = {m.tag: m for m in recs}
+
+    choices: list[questionary.Choice | questionary.Separator] = []
+    if installed:
+        choices.append(questionary.Separator("── installed ──"))
+        for tag in installed:
+            m = rec_by_tag.get(tag) or _bare_preset(tag)
+            choices.append(questionary.Choice(_render_model_choice(m, hw, installed=True), value=m))
+
+    fresh_recs = [m for m in recs if m.tag not in installed]
+    if fresh_recs:
+        choices.append(questionary.Separator("── recommended (will be pulled) ──"))
+        for m in fresh_recs:
+            label = _render_model_choice(m, hw, installed=False)
+            choices.append(questionary.Choice(label, value=m))
+
+    choices.append(questionary.Separator())
+    choices.append(questionary.Choice("Type a custom Ollama tag…", value=CUSTOM_TAG))
+
+    default = next((c for c in choices if isinstance(c, questionary.Choice)), None)
+    answer = questionary.select("Choose a model", choices=choices, default=default).ask()
     if answer is None:
         raise KeyboardInterrupt
+    if answer == CUSTOM_TAG:
+        return _prompt_custom_tag()
     print(f"  ✓ {answer.tag}\n")
     return answer
 
 
-def _filter_to_hardware(presets: list[ModelPreset], hw: dict | None) -> list[ModelPreset]:
-    if not hw:
-        return list(presets)
+def _render_model_choice(m: ModelPreset, hw: dict | None, *, installed: bool) -> str:
+    """Format one model row for the picker. Installed models get a ✓ prefix;
+    over-budget models (per llmfit hw read, if available) get a ⚠ suffix —
+    we still show them, just signal the cost."""
+    prefix = "✓ " if installed else "  "
+    head = m.description or m.tag
+    parts = [f"{prefix}{head}"]
+    metadata: list[str] = []
+    if m.tps_est:
+        metadata.append(f"~{m.tps_est} tok/s")
+    if m.vram_gb or m.ram_gb:
+        metadata.append(f"~{m.vram_gb:.0f}GB VRAM, {m.ram_gb:.0f}GB RAM")
+    if not installed:
+        metadata.append(f"tag: {m.tag}")
+    if metadata:
+        parts.append("         " + " · ".join(metadata))
+    if not installed and hw and not _fits_hardware(m, hw):
+        parts.append("         ⚠ over your hardware budget — will offload to CPU/disk")
+    return "\n".join(parts)
+
+
+def _fits_hardware(m: ModelPreset, hw: dict | None) -> bool:
+    if not hw or (not m.vram_gb and not m.ram_gb):
+        return True
     ram = float(hw.get("total_ram_gb", 0) or 0)
     gpus = hw.get("gpus", []) or []
     vram = float(gpus[0].get("vram_gb", 0)) if gpus else 0.0
-    return [p for p in presets if p.vram_gb <= vram + 0.5 and p.ram_gb <= ram + 0.5]
+    return m.vram_gb <= vram + 0.5 and m.ram_gb <= ram + 0.5
+
+
+def _get_installed_ollama_models() -> list[str]:
+    """Best-effort list of currently-installed Ollama tags. Empty list on any
+    error (daemon unreachable, parse failure) — the picker still works using
+    just the recommendations + custom-tag escape hatch."""
+    try:
+        r = httpx.get("http://localhost:11434/api/tags", timeout=3.0)
+        r.raise_for_status()
+        return [m["name"] for m in r.json().get("models", [])]
+    except Exception:
+        return []
+
+
+def _fetch_recommendations() -> list[ModelPreset] | None:
+    """Pull the curated manifest from RECOMMENDATIONS_URL. None on any failure
+    — caller falls back to the bundled PRESETS list. Manifest format mirrors
+    ModelPreset fields one-for-one."""
+    try:
+        r = httpx.get(RECOMMENDATIONS_URL, timeout=5.0)
+        r.raise_for_status()
+        data = r.json()
+        return [
+            ModelPreset(
+                tag=item["tag"],
+                description=item.get("description", ""),
+                vram_gb=float(item.get("vram_gb", 0)),
+                ram_gb=float(item.get("ram_gb", 0)),
+                tps_est=int(item.get("tps_est", 0)),
+            )
+            for item in data
+        ]
+    except Exception:
+        return None
+
+
+def _bare_preset(tag: str) -> ModelPreset:
+    """ModelPreset for an installed model we have no metadata for. The
+    picker just shows the tag with no fit warning."""
+    return ModelPreset(tag=tag, description="", vram_gb=0, ram_gb=0, tps_est=0)
+
+
+def _prompt_custom_tag() -> ModelPreset:
+    """Free-form tag entry. We can't cheaply pre-validate uninstalled tags
+    (Ollama's registry has no public 'does this exist' endpoint), so we
+    accept any non-empty input and let `pull_model` surface the error if
+    the tag is bogus."""
+    tag = questionary.text(
+        "Ollama tag",
+        default="",
+        instruction="(e.g. qwen3:8b, mistral:7b-instruct, llama3.1:70b)",
+    ).ask()
+    if tag is None:
+        raise KeyboardInterrupt
+    tag = tag.strip()
+    if not tag:
+        raise WizardError("Tag cannot be empty.")
+    print(f"  ✓ {tag} (will validate at pull time)\n")
+    return _bare_preset(tag)
 
 
 def pull_model(model: ModelPreset) -> None:
