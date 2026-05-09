@@ -20,12 +20,19 @@ class BlueskySource(Source):
         self.handle = handle
         self.cadence_seconds = cadence_seconds
         self._client: Client | None = None
+        # Detect missing credentials at construction time so the scheduler
+        # never starts the poll loop, rather than raising every cadence cycle.
+        if not (os.environ.get("BLUESKY_HANDLE") and os.environ.get("BLUESKY_APP_PASSWORD")):
+            self.disabled = True
+            self.disabled_reason = "BLUESKY_HANDLE/BLUESKY_APP_PASSWORD not set in environment"
 
     def _ensure_client(self) -> Client:
         if self._client is not None:
             return self._client
         bsky_handle = os.environ.get("BLUESKY_HANDLE")
         bsky_pw = os.environ.get("BLUESKY_APP_PASSWORD")
+        # Defensive — __init__ should have caught this and disabled the source,
+        # but keep the explicit error for callers that bypass the scheduler.
         if not (bsky_handle and bsky_pw):
             raise RuntimeError(
                 "BLUESKY_HANDLE and BLUESKY_APP_PASSWORD must be set to use bsky sources"
@@ -36,6 +43,8 @@ class BlueskySource(Source):
         return client
 
     async def poll(self) -> list[Article]:
+        if self.disabled:
+            return []
         return await asyncio.to_thread(self._poll_sync)
 
     def _poll_sync(self) -> list[Article]:

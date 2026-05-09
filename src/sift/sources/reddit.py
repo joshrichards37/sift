@@ -34,11 +34,24 @@ class RedditSource(Source):
         self.cadence_seconds = cadence_seconds
 
     async def poll(self) -> list[Article]:
+        if self.disabled:
+            return []
         url = f"https://www.reddit.com/r/{self.subreddit}/top.json"
         params = {"t": "day", "limit": 50}
         headers = {"User-Agent": USER_AGENT}
         async with httpx.AsyncClient(timeout=30.0, headers=headers) as client:
             resp = await client.get(url, params=params)
+            # 404 = subreddit doesn't exist; 403 = private/quarantined. Both
+            # are permanent — disable the source instead of retrying every
+            # cadence cycle until the user notices the log spam.
+            if resp.status_code == 404:
+                self.disabled = True
+                self.disabled_reason = f"r/{self.subreddit} not found (404)"
+                return []
+            if resp.status_code == 403:
+                self.disabled = True
+                self.disabled_reason = f"r/{self.subreddit} is private or quarantined (403)"
+                return []
             resp.raise_for_status()
             payload = resp.json()
 

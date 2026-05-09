@@ -65,6 +65,8 @@ def _reddit_payload(*items: dict[str, Any]) -> dict[str, Any]:
 
 
 class _FakeResponse:
+    status_code = 200
+
     def __init__(self, payload: dict) -> None:
         self._payload = payload
 
@@ -147,6 +149,105 @@ async def test_reddit_handles_empty_payload(fake_reddit) -> None:
     src = RedditSource(id="reddit:test", subreddit="test", min_points=50)
     arts = await src.poll()
     assert arts == []
+
+
+# ── Source self-disable on permanent failure ───────────────────────────────
+
+
+class _FakeStatusResponse:
+    """Reddit /top.json response with a configurable status code. Used to
+    simulate 404/403 without going to the network."""
+
+    def __init__(self, status: int, payload: dict | None = None) -> None:
+        self.status_code = status
+        self._payload = payload or {"data": {"children": []}}
+
+    def raise_for_status(self) -> None:
+        if self.status_code >= 400:
+            raise httpx.HTTPStatusError("err", request=None, response=None)  # type: ignore[arg-type]
+
+    def json(self) -> dict:
+        return self._payload
+
+
+class _FakeStatusClient:
+    status: int = 200
+
+    def __init__(self, *args: Any, **kwargs: Any) -> None: ...
+    async def __aenter__(self) -> _FakeStatusClient:
+        return self
+
+    async def __aexit__(self, *_: Any) -> None: ...
+
+    async def get(self, _url: str, params: dict | None = None) -> _FakeStatusResponse:
+        return _FakeStatusResponse(_FakeStatusClient.status)
+
+
+@pytest.fixture
+def fake_reddit_status(monkeypatch: pytest.MonkeyPatch):
+    def _set(status: int) -> None:
+        _FakeStatusClient.status = status
+        monkeypatch.setattr(httpx, "AsyncClient", _FakeStatusClient)
+
+    return _set
+
+
+async def test_reddit_disables_self_on_404(fake_reddit_status) -> None:
+    """A 404 from /top.json means the subreddit doesn't exist. The source
+    should mark itself disabled so the scheduler stops polling it; otherwise
+    we'd burn cadence cycles forever on an LLM-hallucinated sub name."""
+    fake_reddit_status(404)
+    src = RedditSource(id="reddit:nope", subreddit="nope", min_points=50)
+    assert src.disabled is False
+    arts = await src.poll()
+    assert arts == []
+    assert src.disabled is True
+    assert "404" in src.disabled_reason
+
+
+async def test_reddit_disables_self_on_403(fake_reddit_status) -> None:
+    fake_reddit_status(403)
+    src = RedditSource(id="reddit:private", subreddit="private", min_points=50)
+    arts = await src.poll()
+    assert arts == []
+    assert src.disabled is True
+    assert "403" in src.disabled_reason
+
+
+async def test_reddit_disabled_source_returns_empty_without_request(monkeypatch) -> None:
+    """A pre-disabled source should never hit the network. Patch the client
+    to a sentinel that raises if instantiated."""
+
+    def _explode(*_args: Any, **_kwargs: Any) -> None:
+        raise AssertionError("disabled source must not make HTTP requests")
+
+    monkeypatch.setattr(httpx, "AsyncClient", _explode)
+    src = RedditSource(id="reddit:dead", subreddit="dead", min_points=50)
+    src.disabled = True
+    src.disabled_reason = "test"
+    arts = await src.poll()
+    assert arts == []
+
+
+def test_bluesky_disables_self_when_creds_missing(monkeypatch) -> None:
+    """Construction-time check: missing BLUESKY_* should disable the source
+    immediately so the scheduler never even starts its poll loop."""
+    from sift.sources.bluesky import BlueskySource
+
+    monkeypatch.delenv("BLUESKY_HANDLE", raising=False)
+    monkeypatch.delenv("BLUESKY_APP_PASSWORD", raising=False)
+    src = BlueskySource(id="bsky:test", handle="example.bsky.social")
+    assert src.disabled is True
+    assert "BLUESKY_HANDLE" in src.disabled_reason
+
+
+def test_bluesky_not_disabled_when_creds_present(monkeypatch) -> None:
+    from sift.sources.bluesky import BlueskySource
+
+    monkeypatch.setenv("BLUESKY_HANDLE", "test.bsky.social")
+    monkeypatch.setenv("BLUESKY_APP_PASSWORD", "test-password")
+    src = BlueskySource(id="bsky:test", handle="example.bsky.social")
+    assert src.disabled is False
 
 
 # ── GitHubReleasesSource: payload parsing + filtering ─────────────────────

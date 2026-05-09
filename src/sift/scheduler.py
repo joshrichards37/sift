@@ -21,11 +21,27 @@ async def run_scheduler(
 
 
 async def _poll_loop(source: Source, settings: Settings, prefs: Preferences, llm: LLM) -> None:
+    if source.disabled:
+        log.warning(
+            "source %s: skipping (disabled at construction: %s)",
+            source.id,
+            source.disabled_reason,
+        )
+        return
     while True:
         try:
             await _poll_once(source, settings, prefs, llm)
         except Exception:
             log.exception("source %s: poll failed", source.id)
+        if source.disabled:
+            # poll() detected a permanent failure (e.g. 404) and marked itself
+            # broken. Exit the loop so we stop wasting cadence cycles on it.
+            log.warning(
+                "source %s: disabled after poll (%s) — exiting loop",
+                source.id,
+                source.disabled_reason,
+            )
+            return
         sleep_s = source.cadence_seconds * random.uniform(0.9, 1.1)
         await asyncio.sleep(sleep_s)
 
