@@ -2,6 +2,8 @@ from __future__ import annotations
 
 import asyncio
 import logging
+import sys
+from pathlib import Path
 
 from sift.config import Settings, load_preferences
 from sift.digest import digest_loop
@@ -10,8 +12,30 @@ from sift.scheduler import run_scheduler
 from sift.sources import build_sources
 from sift.storage import init_db
 from sift.telegram_bot import Bot
+from sift.wizard import find_todo_stubs
 
 log = logging.getLogger(__name__)
+
+
+def _check_setup_complete() -> None:
+    """Bail with a helpful message if `.env` still contains `__TODO_*__`
+    placeholders left by a partially-completed `sift-setup` run. Without
+    this, Pydantic emits a confusing validation traceback on first start."""
+    stubs = find_todo_stubs(Path(".env"))
+    if not stubs:
+        return
+    if stubs == ["__no_env_file__"]:
+        print("✗ No .env found. Run `uv run sift-setup` to create one.", file=sys.stderr)
+        sys.exit(2)
+    print(
+        "✗ Setup incomplete — these fields are still TODO in .env:\n"
+        + "\n".join(f"    · {k}" for k in stubs)
+        + "\n\nFill them in, or re-run the wizard for the relevant stage:\n"
+        "    uv run sift-setup --resume backend     # for LLM_*\n"
+        "    uv run sift-setup --resume telegram    # for TELEGRAM_BOT_TOKEN / OWNER_CHAT_ID\n",
+        file=sys.stderr,
+    )
+    sys.exit(2)
 
 
 async def _main() -> None:
@@ -19,6 +43,7 @@ async def _main() -> None:
         level=logging.INFO,
         format="%(asctime)s %(levelname)-7s %(name)s: %(message)s",
     )
+    _check_setup_complete()
     settings = Settings()  # reads .env
     prefs = load_preferences(settings.preferences_path)
     init_db(settings.db_path)

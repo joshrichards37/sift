@@ -1,18 +1,19 @@
 """Interactive setup wizard. Run via `sift-setup` (console script).
 
-Walks the user through:
-  1. Picking an LLM backend (Ollama / LM Studio / llama.cpp / MLX-LM / Hosted)
-  2. Configuring that backend (varies — Ollama auto-pulls, others ask for
-     URL + model and ping the endpoint to confirm it's up)
-  3. Prompting for a Telegram bot token + auto-detecting the chat id
-  4. Picking a preferences preset from examples/
+Walks the user through three stages — LLM backend, Telegram bot, and
+preferences. Every stage can be skipped; skipped stages write
+`__TODO_*__` placeholders into `.env` that `sift` startup detects and
+surfaces with the resume command. Re-run `sift-setup --resume <stage>`
+to fill them in.
 
-No external TUI deps — plain stdin/stdout. Designed to fail loudly at any
-step rather than silently writing a half-baked config.
+Uses questionary for arrow-key menus, password fields, and graceful
+Ctrl+C handling. The wizard is the only place questionary is imported
+— the agent itself runs headless.
 """
 
 from __future__ import annotations
 
+import argparse
 import asyncio
 import json
 import os
@@ -20,19 +21,26 @@ import platform
 import shutil
 import subprocess
 import sys
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from pathlib import Path
 
 import httpx
+import questionary
 
 REPO_ROOT = Path(__file__).resolve().parent.parent.parent
 EXAMPLES_DIR = REPO_ROOT / "examples"
 ENV_PATH = REPO_ROOT / ".env"
 PREFS_PATH = REPO_ROOT / "preferences.yaml"
 
+# Sentinel placed in `.env` for fields the user skipped. Startup greps for
+# this prefix and bails with the resume command rather than letting Pydantic
+# emit a confusing validation traceback.
+TODO_PREFIX = "__TODO_"
+SKIP = "__SKIP__"
 
-# Curated Ollama-tested presets. Tags are mapped from llmfit's recommendations
-# to specific Ollama-library tags that are known to work.
+STAGES = ("backend", "telegram", "prefs")
+
+
 @dataclass(frozen=True)
 class ModelPreset:
     tag: str
@@ -42,6 +50,8 @@ class ModelPreset:
     tps_est: int
 
 
+# Curated Ollama-tested presets. Replaced with a live picker in news-stream-zj7;
+# kept here as the offline fallback when the Ollama daemon isn't reachable.
 PRESETS: list[ModelPreset] = [
     ModelPreset(
         tag="qwen3:30b-a3b-instruct-2507-q4_K_M",
@@ -69,20 +79,18 @@ PRESETS: list[ModelPreset] = [
 
 @dataclass(frozen=True)
 class SysInfo:
-    system: str  # 'Darwin', 'Linux', 'Windows'
-    machine: str  # 'arm64', 'x86_64', etc.
+    system: str
+    machine: str
     is_apple_silicon: bool
 
 
-@dataclass(frozen=True)
+@dataclass
 class BackendConfig:
     base_url: str
     model: str
     api_key: str
 
 
-# Hosted-API presets surfaced in the wizard. (label, base_url, default_model).
-# `base_url=None` is the "Other / I'll type my own URL" escape hatch.
 HOSTED_PRESETS: list[tuple[str, str | None, str | None]] = [
     ("OpenRouter (free + paid)", "https://openrouter.ai/api/v1", "google/gemini-2.5-flash"),
     ("Groq (free tier, fast)", "https://api.groq.com/openai/v1", "llama-3.3-70b-versatile"),
@@ -96,33 +104,49 @@ HOSTED_PRESETS: list[tuple[str, str | None, str | None]] = [
 ]
 
 
+@dataclass
+class WizardState:
+    sys_info: SysInfo
+    backend: BackendConfig | None = None
+    telegram_token: str | None = None
+    chat_id: int | None = None
+    preset_path: Path | None = None
+    skipped: list[str] = field(default_factory=list)
+
+
+class WizardError(RuntimeError):
+    pass
+
+
+# ── Entry ────────────────────────────────────────────────────────────────
+
+
 def main() -> int:
-    print_header()
+    args = _parse_args()
+    print_header(args.resume)
     try:
-        sys_info = detect_os()
-        backend_key = pick_backend(sys_info)
-        cfg = setup_backend(backend_key, sys_info)
+        state = WizardState(sys_info=detect_os())
+        existing = parse_env(ENV_PATH) if ENV_PATH.exists() else {}
+        stages = _stages_to_run(args.resume)
 
-        token = prompt_telegram_token()
-        chat_id = asyncio.run(detect_chat_id(token))
-        print(f"  ✓ chat id detected: {chat_id}\n")
+        if "backend" in stages:
+            run_backend_stage(state)
+        else:
+            preserve_backend(state, existing)
 
-        preset = pick_preset()
+        if "telegram" in stages:
+            run_telegram_stage(state)
+        else:
+            preserve_telegram(state, existing)
 
-        write_env(token, chat_id, cfg)
-        copy_preset(preset)
+        if "prefs" in stages:
+            run_prefs_stage(state)
 
-        print()
-        print("=" * 60)
-        print("Setup complete.")
-        print()
-        print(f"  .env              → {ENV_PATH}")
-        print(f"  preferences.yaml  → {PREFS_PATH}  (from {preset.name})")
-        print()
-        print("Run the agent:")
-        print("  uv run sift")
-        print()
-        print("In Telegram, DM your bot /start to confirm it's wired up.")
+        write_env(state)
+        if "prefs" in stages and state.preset_path is not None:
+            copy_preset(state.preset_path)
+
+        print_summary(state)
         return 0
     except KeyboardInterrupt:
         print("\nAborted.")
@@ -132,74 +156,102 @@ def main() -> int:
         return 1
 
 
-# ── Steps ────────────────────────────────────────────────────────────────
-
-
-def print_header() -> None:
-    print()
-    print("sift setup wizard")
-    print("=" * 60)
-    print(
-        "Walks you through LLM backend, Telegram bot, and preferences\n"
-        "preset selection. Press Ctrl+C any time to abort.\n"
+def _parse_args() -> argparse.Namespace:
+    p = argparse.ArgumentParser(prog="sift-setup", description="sift setup wizard")
+    p.add_argument(
+        "--resume",
+        choices=("all", *STAGES),
+        default="all",
+        help="run only one stage and merge into existing .env (default: all)",
     )
+    return p.parse_args()
 
 
-def detect_os() -> SysInfo:
-    s = platform.system()
-    m = platform.machine()
-    return SysInfo(
-        system=s,
-        machine=m,
-        is_apple_silicon=(s == "Darwin" and m == "arm64"),
-    )
+def _stages_to_run(resume: str) -> set[str]:
+    return set(STAGES) if resume == "all" else {resume}
+
+
+# ── Stages ───────────────────────────────────────────────────────────────
+
+
+def run_backend_stage(state: WizardState) -> None:
+    print_step(1, "LLM backend")
+    backend_key = pick_backend(state.sys_info)
+    if backend_key == SKIP:
+        state.skipped.append("backend")
+        print("  (skipped — fill in LLM_* in .env later or re-run `sift-setup --resume backend`)\n")
+        return
+    state.backend = setup_backend(backend_key, state.sys_info)
+
+
+def run_telegram_stage(state: WizardState) -> None:
+    print_step(2, "Telegram bot")
+    if not _confirm_run_stage("Configure Telegram bot now?"):
+        state.skipped.append("telegram")
+        print(
+            "  (skipped — fill TELEGRAM_BOT_TOKEN + OWNER_CHAT_ID in .env, "
+            "or re-run `sift-setup --resume telegram`)\n"
+        )
+        return
+    state.telegram_token = prompt_telegram_token()
+    state.chat_id = asyncio.run(detect_chat_id(state.telegram_token))
+    print(f"  ✓ chat id detected: {state.chat_id}\n")
+
+
+def run_prefs_stage(state: WizardState) -> None:
+    print_step(3, "Preferences")
+    if not _confirm_run_stage("Pick a preferences preset now?"):
+        state.skipped.append("prefs")
+        print(
+            "  (skipped — copy one of examples/preferences-*.yaml to "
+            "preferences.yaml later, or re-run `sift-setup --resume prefs`)\n"
+        )
+        return
+    state.preset_path = pick_preset()
+
+
+# ── Backend picker ───────────────────────────────────────────────────────
 
 
 def pick_backend(sys_info: SysInfo) -> str:
-    print("[1/4] Choose LLM backend\n")
-    options: list[tuple[str, str, str]] = [
-        (
-            "ollama",
-            "Ollama",
-            "easiest path. Cross-platform, auto-pulls models, recommended for first-timers.",
+    choices: list[questionary.Choice] = [
+        questionary.Choice(
+            "Ollama  — easiest path. Cross-platform, auto-pulls models.",
+            value="ollama",
         ),
-        ("lmstudio", "LM Studio", "GUI app, model browser. Especially nice on macOS."),
-        (
-            "llamacpp",
-            "llama.cpp (llama-server)",
-            "lean, GGUF-native. Run any Hugging Face GGUF.",
+        questionary.Choice(
+            "LM Studio  — GUI app, model browser. Especially nice on macOS.",
+            value="lmstudio",
+        ),
+        questionary.Choice(
+            "llama.cpp (llama-server)  — lean, GGUF-native.",
+            value="llamacpp",
         ),
     ]
     if sys_info.is_apple_silicon:
-        options.append(
-            (
-                "mlx",
-                "MLX-LM",
-                "native Apple Silicon — fastest on M-series. Browse mlx-community on HF.",
+        choices.append(
+            questionary.Choice(
+                "MLX-LM  — native Apple Silicon, fastest on M-series.",
+                value="mlx",
             )
         )
-    options.append(
-        (
-            "hosted",
-            "Hosted API",
-            "OpenRouter / Groq / Together / OpenAI. Free tiers available; no local GPU needed.",
+    choices += [
+        questionary.Choice(
+            "Hosted API  — OpenRouter / Groq / Together / OpenAI.",
+            value="hosted",
+        ),
+        questionary.Separator(),
+        questionary.Choice("Skip — configure later", value=SKIP),
+    ]
+    answer = questionary.select("Choose LLM backend", choices=choices, default=choices[0]).ask()
+    if answer is None:
+        raise KeyboardInterrupt
+    if answer != SKIP:
+        label = next(
+            c.title for c in choices if isinstance(c, questionary.Choice) and c.value == answer
         )
-    )
-
-    for i, (_, label, blurb) in enumerate(options, 1):
-        print(f"  {i}. {label}")
-        print(f"     {blurb}")
-    print()
-    raw = input(f"Pick [1-{len(options)}, default 1]: ").strip() or "1"
-    try:
-        idx = int(raw)
-    except ValueError:
-        idx = 1
-    if not (1 <= idx <= len(options)):
-        idx = 1
-    chosen = options[idx - 1]
-    print(f"  ✓ {chosen[1]}\n")
-    return chosen[0]
+        print(f"  ✓ {label.split('  —')[0].strip()}\n")
+    return answer
 
 
 def setup_backend(key: str, sys_info: SysInfo) -> BackendConfig:
@@ -216,11 +268,10 @@ def setup_backend(key: str, sys_info: SysInfo) -> BackendConfig:
     raise WizardError(f"unknown backend: {key}")
 
 
-# ── Ollama backend ───────────────────────────────────────────────────────
+# ── Ollama ───────────────────────────────────────────────────────────────
 
 
 def setup_ollama() -> BackendConfig:
-    print("[2/4] Ollama setup")
     check_ollama()
     hw = read_hardware()
     if hw:
@@ -299,26 +350,23 @@ def print_hardware(hw: dict) -> None:
 
 
 def pick_model(hw: dict | None) -> ModelPreset:
-    print("  Choose a model:")
     candidates = _filter_to_hardware(PRESETS, hw)
     if not candidates:
-        candidates = PRESETS  # let user pick anyway; they may know better
-    for i, m in enumerate(candidates, 1):
-        print(f"    {i}. {m.description}")
-        print(
-            f"         tag: {m.tag} · est. {m.tps_est} tok/s "
-            f"· needs ~{m.vram_gb:.0f}GB VRAM, {m.ram_gb:.0f}GB RAM"
+        candidates = PRESETS
+    choices = [
+        questionary.Choice(
+            f"{m.description}\n         "
+            f"tag: {m.tag} · est. {m.tps_est} tok/s · "
+            f"~{m.vram_gb:.0f}GB VRAM, {m.ram_gb:.0f}GB RAM",
+            value=m,
         )
-    print()
-    default = 1
-    raw = input(f"  Pick [1-{len(candidates)}, default {default}]: ").strip() or str(default)
-    try:
-        idx = max(1, min(len(candidates), int(raw)))
-    except ValueError:
-        idx = default
-    chosen = candidates[idx - 1]
-    print(f"  ✓ {chosen.tag}\n")
-    return chosen
+        for m in candidates
+    ]
+    answer = questionary.select("Choose a model", choices=choices, default=choices[0]).ask()
+    if answer is None:
+        raise KeyboardInterrupt
+    print(f"  ✓ {answer.tag}\n")
+    return answer
 
 
 def _filter_to_hardware(presets: list[ModelPreset], hw: dict | None) -> list[ModelPreset]:
@@ -349,16 +397,14 @@ def pull_model(model: ModelPreset) -> None:
     print()
 
 
-# ── LM Studio backend ────────────────────────────────────────────────────
+# ── LM Studio / llama.cpp / MLX-LM ───────────────────────────────────────
 
 
 def setup_lmstudio(sys_info: SysInfo) -> BackendConfig:
-    print("[2/4] LM Studio setup")
     print(
         "  Open LM Studio (download from https://lmstudio.ai if you haven't),\n"
-        "  pull a model from the in-app Discover tab, then click the\n"
-        "  'Developer' (or 'Local Server') tab and hit 'Start Server'.\n"
-        "  Default endpoint is localhost:1234.\n"
+        "  pull a model from the Discover tab, then under 'Developer' (or\n"
+        "  'Local Server') hit 'Start Server'. Default endpoint is :1234.\n"
     )
     base_url = prompt_url("LM Studio URL", "http://localhost:1234/v1")
     _verify_openai_endpoint(base_url, label="LM Studio")
@@ -370,11 +416,7 @@ def setup_lmstudio(sys_info: SysInfo) -> BackendConfig:
     return BackendConfig(base_url=base_url, model=model, api_key="lmstudio")
 
 
-# ── llama.cpp backend ────────────────────────────────────────────────────
-
-
 def setup_llamacpp(sys_info: SysInfo) -> BackendConfig:
-    print("[2/4] llama.cpp setup")
     install_hint = {
         "Darwin": "  Install: brew install llama.cpp",
         "Linux": "  Install: see https://github.com/ggml-org/llama.cpp#building",
@@ -395,11 +437,7 @@ def setup_llamacpp(sys_info: SysInfo) -> BackendConfig:
     return BackendConfig(base_url=base_url, model=model, api_key="llamacpp")
 
 
-# ── MLX-LM backend (Apple Silicon) ───────────────────────────────────────
-
-
 def setup_mlx() -> BackendConfig:
-    print("[2/4] MLX-LM setup (Apple Silicon)")
     print(
         "  MLX-LM is the native Apple Silicon path — fastest on M-series.\n"
         "  Install + serve a model in one terminal:\n"
@@ -416,48 +454,46 @@ def setup_mlx() -> BackendConfig:
     return BackendConfig(base_url=base_url, model=model, api_key="mlx")
 
 
-# ── Hosted API backend ───────────────────────────────────────────────────
+# ── Hosted ───────────────────────────────────────────────────────────────
 
 
 def setup_hosted() -> BackendConfig:
-    print("[2/4] Hosted API setup")
-    print("  Pick a provider:\n")
-    for i, (label, _, _) in enumerate(HOSTED_PRESETS, 1):
-        print(f"  {i}. {label}")
-    print()
-    raw = input(f"Pick [1-{len(HOSTED_PRESETS)}, default 1]: ").strip() or "1"
-    try:
-        idx = int(raw)
-    except ValueError:
-        idx = 1
-    if not (1 <= idx <= len(HOSTED_PRESETS)):
-        idx = 1
-    label, url, default_model = HOSTED_PRESETS[idx - 1]
+    choices = [
+        questionary.Choice(label, value=(label, url, model)) for label, url, model in HOSTED_PRESETS
+    ]
+    answer = questionary.select("Pick a provider", choices=choices, default=choices[0]).ask()
+    if answer is None:
+        raise KeyboardInterrupt
+    label, url, default_model = answer
     print(f"  ✓ {label}\n")
 
     if url is None:
         url = prompt_url("Provider base URL (must end in /v1)", "")
 
-    api_key = input("API key (won't be echoed back): ").strip()
+    api_key = questionary.password("API key").ask()
+    if api_key is None:
+        raise KeyboardInterrupt
+    api_key = api_key.strip()
     if not api_key:
         raise WizardError("API key is required for hosted backends.")
 
     model = prompt_str("Model name", default_model or "", required=True)
-
     return BackendConfig(base_url=url, model=model, api_key=api_key)
 
 
-# ── Telegram + preferences ───────────────────────────────────────────────
+# ── Telegram ─────────────────────────────────────────────────────────────
 
 
 def prompt_telegram_token() -> str:
-    print("[3/4] Telegram bot")
     print(
         "  In Telegram, DM @BotFather and send /newbot. After picking a name\n"
         "  and username, BotFather will give you a token like 12345:AAH...\n"
     )
     while True:
-        token = input("Paste the bot token: ").strip()
+        token = questionary.password("Paste the bot token").ask()
+        if token is None:
+            raise KeyboardInterrupt
+        token = token.strip()
         if ":" not in token or len(token) < 30:
             print("  That doesn't look like a valid token; try again.")
             continue
@@ -481,7 +517,7 @@ async def detect_chat_id(token: str) -> int:
 
     base = f"https://api.telegram.org/bot{token}"
     offset = 0
-    deadline = asyncio.get_event_loop().time() + 300  # 5 minutes
+    deadline = asyncio.get_event_loop().time() + 300
 
     async with httpx.AsyncClient(timeout=30) as client:
         while asyncio.get_event_loop().time() < deadline:
@@ -507,45 +543,99 @@ async def detect_chat_id(token: str) -> int:
         raise WizardError("Timed out waiting for a message. Re-run the wizard and try again.")
 
 
+# ── Preferences ──────────────────────────────────────────────────────────
+
+
 def pick_preset() -> Path:
-    print("[4/4] Pick a preferences preset:")
     presets = sorted(EXAMPLES_DIR.glob("preferences-*.yaml"))
     if not presets:
         raise WizardError(f"No presets found in {EXAMPLES_DIR}")
-    for i, p in enumerate(presets, 1):
-        name = p.stem.removeprefix("preferences-")
-        print(f"  {i}. {name}")
-    print(f"  {len(presets) + 1}. blank skeleton — edit by hand")
-    print()
-    raw = input(f"Pick [1-{len(presets) + 1}, default 1]: ").strip() or "1"
-    try:
-        idx = int(raw)
-    except ValueError:
-        idx = 1
-    if 1 <= idx <= len(presets):
-        chosen = presets[idx - 1]
-    else:
-        chosen = REPO_ROOT / "preferences.example.yaml"
-    print(f"  ✓ {chosen.name}\n")
-    return chosen
+    choices = [questionary.Choice(p.stem.removeprefix("preferences-"), value=p) for p in presets]
+    blank = REPO_ROOT / "preferences.example.yaml"
+    choices.append(questionary.Choice("blank skeleton — edit by hand", value=blank))
+    answer = questionary.select(
+        "Pick a preferences preset", choices=choices, default=choices[0]
+    ).ask()
+    if answer is None:
+        raise KeyboardInterrupt
+    print(f"  ✓ {answer.name}\n")
+    return answer
 
 
 # ── File output ──────────────────────────────────────────────────────────
 
 
-def write_env(token: str, chat_id: int, cfg: BackendConfig) -> None:
+def parse_env(path: Path) -> dict[str, str]:
+    """Parse a `.env`-style file into a dict. Comment lines and blanks are
+    skipped; quoted values have their quotes stripped. Used by --resume to
+    preserve fields the user isn't re-running."""
+    out: dict[str, str] = {}
+    if not path.exists():
+        return out
+    for raw in path.read_text(encoding="utf-8").splitlines():
+        line = raw.strip()
+        if not line or line.startswith("#"):
+            continue
+        if "=" not in line:
+            continue
+        k, _, v = line.partition("=")
+        v = v.strip().strip('"').strip("'")
+        out[k.strip()] = v
+    return out
+
+
+def preserve_backend(state: WizardState, env: dict[str, str]) -> None:
+    """Populate state.backend from existing .env. Skipped silently if any
+    field is missing or carries a TODO marker — write_env will re-stub it."""
+    base_url = env.get("LLM_BASE_URL", "")
+    model = env.get("LLM_MODEL", "")
+    api_key = env.get("LLM_API_KEY", "")
+    if all(_is_real(v) for v in (base_url, model, api_key)):
+        state.backend = BackendConfig(base_url=base_url, model=model, api_key=api_key)
+    else:
+        state.skipped.append("backend")
+
+
+def preserve_telegram(state: WizardState, env: dict[str, str]) -> None:
+    token = env.get("TELEGRAM_BOT_TOKEN", "")
+    chat_id_raw = env.get("OWNER_CHAT_ID", "")
+    if _is_real(token) and _is_real(chat_id_raw):
+        try:
+            state.chat_id = int(chat_id_raw)
+            state.telegram_token = token
+        except ValueError:
+            state.skipped.append("telegram")
+    else:
+        state.skipped.append("telegram")
+
+
+def _is_real(v: str) -> bool:
+    return bool(v) and not v.startswith(TODO_PREFIX)
+
+
+def write_env(state: WizardState) -> None:
+    """Write `.env` from `state`. Missing fields become `__TODO_<NAME>__`
+    placeholders that `sift` startup detects and surfaces. Existing `.env`
+    is backed up to `.env.bak`."""
     if ENV_PATH.exists():
         backup = ENV_PATH.with_suffix(".env.bak")
         ENV_PATH.replace(backup)
         print(f"  (backed up existing .env → {backup.name})")
+
+    token = state.telegram_token or _todo("TELEGRAM_BOT_TOKEN")
+    chat_id = str(state.chat_id) if state.chat_id is not None else _todo("OWNER_CHAT_ID")
+    base_url = state.backend.base_url if state.backend else _todo("LLM_BASE_URL")
+    model = state.backend.model if state.backend else _todo("LLM_MODEL")
+    api_key = state.backend.api_key if state.backend else _todo("LLM_API_KEY")
+
     ENV_PATH.write_text(
         f"TELEGRAM_BOT_TOKEN={token}\n"
         f"OWNER_CHAT_ID={chat_id}\n"
         f"# AUTHORIZED_CHAT_IDS=\n"
         f"\n"
-        f"LLM_BASE_URL={cfg.base_url}\n"
-        f"LLM_MODEL={cfg.model}\n"
-        f"LLM_API_KEY={cfg.api_key}\n"
+        f"LLM_BASE_URL={base_url}\n"
+        f"LLM_MODEL={model}\n"
+        f"LLM_API_KEY={api_key}\n"
         f"\n"
         f"# BLUESKY_HANDLE=\n"
         f"# BLUESKY_APP_PASSWORD=\n"
@@ -554,6 +644,10 @@ def write_env(token: str, chat_id: int, cfg: BackendConfig) -> None:
         f"PREFERENCES_PATH=./preferences.yaml\n"
     )
     os.chmod(ENV_PATH, 0o600)
+
+
+def _todo(name: str) -> str:
+    return f"{TODO_PREFIX}{name}__"
 
 
 def copy_preset(src: Path) -> None:
@@ -568,20 +662,32 @@ def copy_preset(src: Path) -> None:
 
 
 def prompt_url(label: str, default: str) -> str:
-    suffix = f" [{default}]" if default else ""
-    raw = input(f"  {label}{suffix}: ").strip() or default
+    raw = questionary.text(label, default=default).ask()
+    if raw is None:
+        raise KeyboardInterrupt
+    raw = raw.strip()
     if not raw.startswith(("http://", "https://")):
         raise WizardError(f"URL must start with http:// or https:// — got {raw!r}")
     return raw
 
 
 def prompt_str(label: str, default: str, *, required: bool = False) -> str:
-    suffix = f" [{default}]" if default else ""
-    raw = input(f"  {label}{suffix}: ").strip()
-    value = raw or default
+    raw = questionary.text(label, default=default).ask()
+    if raw is None:
+        raise KeyboardInterrupt
+    value = raw.strip() or default
     if required and not value:
         raise WizardError(f"{label} is required.")
     return value
+
+
+def _confirm_run_stage(prompt: str) -> bool:
+    """Y/N prompt for skipping a stage. Defaults to yes (run it) since users
+    arriving at the wizard generally want to fill things in."""
+    answer = questionary.confirm(prompt, default=True).ask()
+    if answer is None:
+        raise KeyboardInterrupt
+    return answer
 
 
 def _verify_openai_endpoint(base_url: str, *, label: str = "endpoint") -> None:
@@ -599,8 +705,77 @@ def _verify_openai_endpoint(base_url: str, *, label: str = "endpoint") -> None:
         print("    Continuing — sift will fail at runtime if this stays unreachable.\n")
 
 
-class WizardError(RuntimeError):
-    pass
+# ── Output ───────────────────────────────────────────────────────────────
+
+
+def print_header(resume: str) -> None:
+    print()
+    print("sift setup wizard")
+    print("=" * 60)
+    if resume == "all":
+        print(
+            "Three stages: LLM backend, Telegram bot, preferences.\n"
+            "Skip any stage and re-run with `--resume <stage>` later.\n"
+        )
+    else:
+        print(f"Resuming stage: {resume}\n")
+
+
+def print_step(idx: int, label: str) -> None:
+    print(f"[{idx}/3] {label}\n")
+
+
+def detect_os() -> SysInfo:
+    s = platform.system()
+    m = platform.machine()
+    return SysInfo(
+        system=s,
+        machine=m,
+        is_apple_silicon=(s == "Darwin" and m == "arm64"),
+    )
+
+
+def print_summary(state: WizardState) -> None:
+    print()
+    print("=" * 60)
+    print("Setup complete." if not state.skipped else "Setup partially complete.")
+    print()
+    print(f"  .env              → {ENV_PATH}")
+    if state.preset_path is not None:
+        print(f"  preferences.yaml  → {PREFS_PATH}  (from {state.preset_path.name})")
+    elif "prefs" in state.skipped:
+        print("  preferences.yaml  → not written (stage skipped)")
+    print()
+    if state.skipped:
+        print("Skipped stages — fill in later:")
+        for stage in state.skipped:
+            print(f"  · {stage}      uv run sift-setup --resume {stage}")
+        print()
+        print("`uv run sift` will refuse to start until every TODO marker is filled in.")
+    else:
+        print("Run the agent:")
+        print("  uv run sift")
+        print()
+        print("In Telegram, DM your bot /start to confirm it's wired up.")
+
+
+# ── Public helpers consumed by main.py ───────────────────────────────────
+
+
+def find_todo_stubs(env_path: Path) -> list[str]:
+    """Return the list of `.env` keys whose value is still a `__TODO_*__`
+    placeholder. Empty list = setup is complete enough to start the agent."""
+    if not env_path.exists():
+        return ["__no_env_file__"]
+    out: list[str] = []
+    for raw in env_path.read_text(encoding="utf-8").splitlines():
+        line = raw.strip()
+        if not line or line.startswith("#") or "=" not in line:
+            continue
+        k, _, v = line.partition("=")
+        if v.strip().startswith(TODO_PREFIX):
+            out.append(k.strip())
+    return out
 
 
 if __name__ == "__main__":
