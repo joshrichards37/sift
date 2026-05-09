@@ -776,6 +776,24 @@ query (str, optional keywords to AND with categories), max_results (int, default
   - id: masto:<slug>          fields: handle (str, "user@instance.tld", \
 e.g. "simon@simonwillison.net")
 
+CRITICAL: ALWAYS include the kind-specific field even when the id slug looks like it \
+duplicates the value. The slug after the colon is just a label — sift does NOT parse it \
+for config. Examples:
+
+  CORRECT:
+    - id: github:vllm
+      repo: vllm-project/vllm
+    - id: rss:simon
+      url: https://simonwillison.net/atom.xml
+    - id: reddit:localllama
+      subreddit: LocalLLaMA
+
+  WRONG (will fail at runtime):
+    - id: github:vllm-project/vllm   # repo: missing
+      enabled: true
+    - id: rss:https://simon.net/feed # url: missing
+      enabled: true
+
 Generate 3-6 source entries matching the user's interests.
 
 Hard constraints — silently ignored sources are worse than no sources:
@@ -1021,10 +1039,17 @@ async def _check_one_source(client: httpx.AsyncClient, source: dict) -> str | No
         sub = source.get("subreddit") or ""
         if not sub:
             return "missing subreddit"
-        # /about.json returns 404 when a sub doesn't exist, 403 if private/quarantined.
-        check_url = f"https://www.reddit.com/r/{sub.split('+')[0]}/about.json"
+        # Use the same endpoint + UA the runtime RedditSource uses. /about.json
+        # 403s on some otherwise-public subs (e.g. LocalLLaMA) for reasons
+        # known only to Reddit; /top.json is what we'll actually poll, so it
+        # matches runtime behavior exactly. limit=1 keeps the pre-flight cheap.
+        check_url = f"https://www.reddit.com/r/{sub.split('+')[0]}/top.json"
         try:
-            r = await client.get(check_url, headers={"User-Agent": "sift-setup/1.0"})
+            r = await client.get(
+                check_url,
+                params={"t": "day", "limit": 1},
+                headers={"User-Agent": "sift-bot/0.1 (self-hosted personal news agent)"},
+            )
             if r.status_code == 404:
                 return "subreddit not found"
             if r.status_code == 403:
