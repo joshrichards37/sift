@@ -60,7 +60,10 @@ sources:
     cadence_seconds: 1800
 
   # An RSS or Atom feed. Anything feedparser handles works (RSS, Atom,
-  # YouTube channel feeds, Substack, etc.).
+  # YouTube channel feeds, Substack, Lobsters tagged feeds, etc.). For
+  # Lobsters specifically: https://lobste.rs/t/<tag>.rss for one tag, or
+  # https://lobste.rs/rss for the front page. Tag list at lobste.rs/tags.
+  # YouTube channel feeds: https://www.youtube.com/feeds/videos.xml?channel_id=<UC...>.
   - id: rss:example-blog
     enabled: true
     url: https://example.com/feed.xml

@@ -78,6 +78,20 @@ sources:
     url: https://hackaday.com/blog/feed/
     cadence_seconds: 7200
 
+  # Lobsters — narrower, higher-signal aggregator than HN. Tagged RSS feeds
+  # at https://lobste.rs/t/<tag>.rss let you slice it by topic; combine
+  # multiple tags with .rss?tags=a,b,c. See https://lobste.rs/tags for the
+  # full list (programming, security, distributed, hardware, …).
+  - id: rss:lobsters-front
+    enabled: true
+    url: https://lobste.rs/rss
+    cadence_seconds: 3600
+
+  - id: rss:lobsters-prog
+    enabled: true
+    url: https://lobste.rs/t/programming.rss
+    cadence_seconds: 7200
+
   # Communities — JSON API with min-score filter (kills low-effort posts)
   - id: reddit:programming
     enabled: true
