@@ -90,7 +90,7 @@ CI runs these on every PR (`.github/workflows/ci.yml`); the `lint` check is requ
 
 ## Conventions
 
-- **Source IDs are stable strings** (`hn`, `reddit:sub`, `bsky:handle`, `rss:slug`). Used as foreign keys in storage and filter labels in preferences. Never reuse an ID for a different source.
+- **Source IDs are stable strings** (`hn`, `rss:slug`, `reddit:sub`, `bsky:handle`, `github:slug`, `arxiv:slug`, `masto:slug`). Used as foreign keys in storage and filter labels in preferences. Never reuse an ID for a different source. Allowed kinds live in `sift.sources.KNOWN_KINDS`; `SourcePref._check_kind` validates at parse time.
 - **Times are UTC, ISO-8601 strings in the DB**, `datetime` objects in code. Convert at the boundary only.
 - **Secrets in `.env`, preferences in `preferences.yaml`.** Both are gitignored. `.env.example` and `preferences.example.yaml` ship in the repo as starting templates; `examples/` ships full domain presets.
 - **No Telegram message > 4096 chars.** `_chunk()` in `telegram_bot.py` splits on paragraph boundaries to keep HTML well-formed across chunks.
