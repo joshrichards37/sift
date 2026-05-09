@@ -18,14 +18,17 @@ import asyncio
 import json
 import os
 import platform
+import re
 import shutil
 import subprocess
 import sys
+import tempfile
 from dataclasses import dataclass, field
 from pathlib import Path
 
 import httpx
 import questionary
+import yaml
 
 REPO_ROOT = Path(__file__).resolve().parent.parent.parent
 EXAMPLES_DIR = REPO_ROOT / "examples"
@@ -119,6 +122,7 @@ class WizardState:
     telegram_token: str | None = None
     chat_id: int | None = None
     preset_path: Path | None = None
+    drafted_yaml: str | None = None  # set if user accepted an LLM-drafted prefs.yaml
     skipped: list[str] = field(default_factory=list)
 
 
@@ -151,8 +155,11 @@ def main() -> int:
             run_prefs_stage(state)
 
         write_env(state)
-        if "prefs" in stages and state.preset_path is not None:
-            copy_preset(state.preset_path)
+        if "prefs" in stages:
+            if state.drafted_yaml is not None:
+                write_drafted_prefs(state.drafted_yaml)
+            elif state.preset_path is not None:
+                copy_preset(state.preset_path)
 
         print_summary(state)
         return 0
@@ -208,14 +215,50 @@ def run_telegram_stage(state: WizardState) -> None:
 
 def run_prefs_stage(state: WizardState) -> None:
     print_step(3, "Preferences")
-    if not _confirm_run_stage("Pick a preferences preset now?"):
+    if not _confirm_run_stage("Configure preferences now?"):
         state.skipped.append("prefs")
         print(
             "  (skipped — copy one of examples/preferences-*.yaml to "
             "preferences.yaml later, or re-run `sift-setup --resume prefs`)\n"
         )
         return
+
+    # Drafting needs a working backend; without one we can only offer presets.
+    mode = _pick_prefs_mode(can_draft=state.backend is not None)
+    if mode == "draft":
+        drafted = _draft_prefs_loop(state)
+        if drafted is not None:
+            state.drafted_yaml = drafted
+            return
+        # User abandoned the draft — fall through to preset pick rather than
+        # leave them with nothing.
+        print("  Falling back to preset selection.\n")
     state.preset_path = pick_preset()
+
+
+def _pick_prefs_mode(*, can_draft: bool) -> str:
+    """Returns 'draft' or 'preset'. Skips the prompt entirely when drafting
+    is unavailable (no backend) — there's only one path forward."""
+    if not can_draft:
+        return "preset"
+    choices = [
+        questionary.Choice(
+            "Describe what you follow — let the LLM draft a preferences.yaml",
+            value="draft",
+        ),
+        questionary.Choice(
+            "Pick a preset from examples/  (ai-tooling, tech-news, …)",
+            value="preset",
+        ),
+    ]
+    answer = questionary.select(
+        "How do you want to configure preferences?",
+        choices=choices,
+        default=choices[0],
+    ).ask()
+    if answer is None:
+        raise KeyboardInterrupt
+    return answer
 
 
 # ── Backend picker ───────────────────────────────────────────────────────
@@ -666,6 +709,221 @@ def pick_preset() -> Path:
     return answer
 
 
+# ── LLM-drafted preferences ──────────────────────────────────────────────
+
+
+# Pinned in the wizard rather than llm.py because the agent itself never
+# generates preferences — only the wizard does. Keeping the prompt local
+# means tuning it doesn't ripple into the runtime path.
+DRAFT_PREFS_SYSTEM = """You generate a complete preferences.yaml for sift, a personal news bot. \
+The user describes what they want to follow in plain language. You output \
+ONLY the YAML — no preamble, no commentary, no markdown fences.
+
+Required structure:
+
+topics: |
+  - <bullet 1: be specific, name people/products/concepts where you can>
+  - <bullet 2>
+  - <bullet 3>
+
+  Score down: <kinds of articles to push back on, e.g. funding rounds w/o product implications>
+
+exclude_keywords:
+  - <hard-exclusion keyword if obviously off-topic>
+relevance_threshold: 7
+summary_target_words: 50
+max_per_cycle: 3
+digest_time: "09:00"
+digest_size: 10
+more_size: 5
+
+sources:
+  - id: <source id, see allowed kinds below>
+    enabled: true
+    cadence_seconds: 1800
+    <kind-specific fields>
+
+Allowed source kinds and their fields:
+  - id: hn                    fields: query (str, multiple terms joined " OR "), min_points (int)
+  - id: rss:<slug>            fields: url (str, full feed URL)
+  - id: reddit:<slug>         fields: subreddit (str, single name or "a+b+c"), min_points (int)
+  - id: bsky:<handle>         fields: handle (str, e.g. someone.bsky.social)
+
+Generate 3-6 source entries matching the user's interests. Pick real, well-known feeds where \
+you can; use plausible URLs/handles where you can't. Do not invent new source kinds.
+
+Output the YAML and nothing else."""
+
+
+def _draft_prefs_loop(state: WizardState) -> str | None:
+    """Run the description → draft → review loop. Returns the accepted YAML
+    string or None if the user gave up. State.backend must be populated."""
+    assert state.backend is not None
+    if _looks_small(state.backend.model):
+        print(
+            "  ⚠ The chosen model looks small (~8B or under). Drafted YAML may be\n"
+            "    rough — feel free to re-prompt or fall back to a preset.\n"
+        )
+    description = _prompt_description(initial=None)
+    if not description:
+        print("  (empty description — cancelling draft)\n")
+        return None
+
+    while True:
+        print(f"  Asking {state.backend.model} for a preferences.yaml…")
+        try:
+            yaml_text = asyncio.run(_call_llm_for_yaml(state.backend, description))
+        except Exception as e:
+            print(f"  ✗ LLM call failed: {e}\n")
+            return None
+        print()
+        print("  ── Drafted preferences.yaml ──")
+        print(_indent(yaml_text, "  "))
+        print()
+        valid = _yaml_is_valid(yaml_text)
+        if not valid:
+            print("  ⚠ This doesn't validate against the Preferences schema.\n")
+
+        accept_disabled = "invalid YAML — edit first" if not valid else None
+        action = questionary.select(
+            "What now?",
+            choices=[
+                questionary.Choice("Accept and save", value="accept", disabled=accept_disabled),
+                questionary.Choice("Re-prompt with a different description", value="reprompt"),
+                questionary.Choice("Edit in $EDITOR before saving", value="edit"),
+                questionary.Choice("Cancel — pick a preset instead", value="cancel"),
+            ],
+        ).ask()
+        if action is None:
+            raise KeyboardInterrupt
+        if action == "accept":
+            return yaml_text
+        if action == "reprompt":
+            new_desc = _prompt_description(initial=description)
+            if new_desc:
+                description = new_desc
+            continue
+        if action == "edit":
+            edited = _edit_in_editor(yaml_text)
+            if not edited.strip():
+                print("  (empty after edit — keeping previous draft)\n")
+                continue
+            if not _yaml_is_valid(edited):
+                print("  ⚠ Edited YAML still doesn't validate.")
+                keep = questionary.confirm("Save invalid YAML anyway?", default=False).ask()
+                if keep:
+                    return edited
+                yaml_text = edited
+                continue
+            return edited
+        return None  # cancel
+
+
+async def _call_llm_for_yaml(backend: BackendConfig, description: str) -> str:
+    """Ask the user's configured LLM to draft a preferences.yaml. Returns the
+    raw model output with code fences stripped. Validation happens in the
+    caller — we don't want to retry-loop here when the model returns
+    something unparseable."""
+    from openai import AsyncOpenAI
+
+    client = AsyncOpenAI(base_url=backend.base_url, api_key=backend.api_key)
+    resp = await client.chat.completions.create(
+        model=backend.model,
+        messages=[
+            {"role": "system", "content": DRAFT_PREFS_SYSTEM},
+            {
+                "role": "user",
+                "content": f"User interests:\n\n{description}\n\nGenerate the YAML.",
+            },
+        ],
+        temperature=0.4,
+    )
+    return _strip_code_fences(resp.choices[0].message.content or "")
+
+
+def _strip_code_fences(s: str) -> str:
+    """Strip ```yaml ... ``` fences if the model wrapped its output, even
+    though we explicitly asked it not to. Smaller models forget this rule."""
+    s = s.strip()
+    if s.startswith("```"):
+        first_nl = s.find("\n")
+        if first_nl != -1:
+            s = s[first_nl + 1 :]
+    if s.endswith("```"):
+        s = s[: s.rfind("```")]
+    return s.strip()
+
+
+def _yaml_is_valid(yaml_text: str) -> bool:
+    """Validate that the drafted YAML parses *and* matches the Preferences
+    schema (so we don't accept output that has the right shape but breaks
+    Pydantic on first run)."""
+    if not yaml_text.strip():
+        return False
+    try:
+        from sift.config import Preferences
+
+        data = yaml.safe_load(yaml_text)
+        Preferences.model_validate(data)
+        return True
+    except Exception:
+        return False
+
+
+def _looks_small(model_tag: str) -> bool:
+    """Heuristic: does the model tag look like a model with ≤8B parameters?
+    Used only to surface a soft warning — false negatives (e.g. MoE models
+    where the digit is total params, not active) are tolerable since the
+    user can ignore the warning anyway."""
+    m = re.search(r"[:\-_](\d+(?:\.\d+)?)b\b", model_tag.lower())
+    if not m:
+        return False
+    return float(m.group(1)) <= 8
+
+
+def _indent(text: str, prefix: str) -> str:
+    return "\n".join(prefix + line for line in text.splitlines())
+
+
+def _prompt_description(*, initial: str | None) -> str:
+    """Open $EDITOR for free-text input. Pre-populates with a brief help
+    template (or the user's previous description on re-prompt). Returns the
+    body with comment lines stripped."""
+    template_lines = [
+        "# Describe what you want to follow. Be specific:",
+        "#   - name people, companies, products you actually read",
+        "#   - say what you DON'T want too (e.g. 'no funding rounds')",
+        "# Lines starting with # are stripped.",
+        "#",
+        "# Save and close to continue. Empty file = cancel.",
+        "",
+    ]
+    if initial:
+        template_lines.append(initial)
+        template_lines.append("")
+    edited = _edit_in_editor("\n".join(template_lines))
+    return "\n".join(
+        line for line in edited.splitlines() if not line.lstrip().startswith("#")
+    ).strip()
+
+
+def _edit_in_editor(content: str) -> str:
+    """Drop content into a tempfile, hand it to $EDITOR (or nano/vi), return
+    whatever the user saved. Used for both description input and YAML edits."""
+    import contextlib
+
+    editor = os.environ.get("EDITOR") or shutil.which("nano") or "vi"
+    fd, path = tempfile.mkstemp(suffix=".yaml", text=True)
+    try:
+        with os.fdopen(fd, "w", encoding="utf-8") as f:
+            f.write(content)
+        subprocess.call([editor, path])
+        return Path(path).read_text(encoding="utf-8")
+    finally:
+        with contextlib.suppress(OSError):
+            os.unlink(path)
+
+
 # ── File output ──────────────────────────────────────────────────────────
 
 
@@ -762,6 +1020,17 @@ def copy_preset(src: Path) -> None:
     shutil.copy(src, PREFS_PATH)
 
 
+def write_drafted_prefs(yaml_text: str) -> None:
+    """Persist an LLM-drafted preferences.yaml. Backs up any existing file
+    so the user can recover their hand-written prefs if the draft replaces
+    something they cared about."""
+    if PREFS_PATH.exists():
+        backup = PREFS_PATH.with_suffix(".yaml.bak")
+        PREFS_PATH.replace(backup)
+        print(f"  (backed up existing preferences.yaml → {backup.name})")
+    PREFS_PATH.write_text(yaml_text.rstrip() + "\n", encoding="utf-8")
+
+
 # ── Helpers ──────────────────────────────────────────────────────────────
 
 
@@ -845,7 +1114,9 @@ def print_summary(state: WizardState) -> None:
     print("Setup complete." if not state.skipped else "Setup partially complete.")
     print()
     print(f"  .env              → {ENV_PATH}")
-    if state.preset_path is not None:
+    if state.drafted_yaml is not None:
+        print(f"  preferences.yaml  → {PREFS_PATH}  (LLM-drafted)")
+    elif state.preset_path is not None:
         print(f"  preferences.yaml  → {PREFS_PATH}  (from {state.preset_path.name})")
     elif "prefs" in state.skipped:
         print("  preferences.yaml  → not written (stage skipped)")
